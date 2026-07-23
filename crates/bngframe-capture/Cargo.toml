@@ -1,0 +1,11 @@
+[package]
+name = "bngframe-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

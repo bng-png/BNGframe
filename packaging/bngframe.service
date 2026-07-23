@@ -1,0 +1,17 @@
+[Unit]
+Description=BNGframe Warframe companion daemon
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bngframe
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+# Optional ptrace for inventory (prefer setcap on the binary instead):
+# Environment=…
+
+[Install]
+WantedBy=default.target
