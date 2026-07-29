@@ -68,7 +68,7 @@ impl AnalyticsService {
     pub fn language_matrix() -> HashMap<&'static str, bool> {
         HashMap::from([
             ("en", true),
-            ("ru", true), // UI localized; OCR still primarily English in-game text
+            ("ru", true), // UI + OCR via tesseract rus / rus+eng and WFM name_ru
             ("de", false),
             ("fr", false),
             ("es", false),

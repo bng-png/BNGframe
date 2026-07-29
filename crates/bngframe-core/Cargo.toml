@@ -22,3 +22,5 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+xz2.workspace = true
+rapidocr-core = { version = "0.2.2", default-features = false }

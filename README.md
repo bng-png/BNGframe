@@ -14,9 +14,11 @@ Browser SPA (web/)  <── HTTP/WS 127.0.0.1:17832 ──>  bngframe daemon (Ru
 
 - Rust toolchain, Node 20+
 - Wayland compositor (tested target: **Hyprland** / wlroots)
-- `grim`, `tesseract` (+ `tesseract-data-eng`)
+- `grim`, `tesseract` (+ `tesseract-data-eng`; for Russian game UI also `tesseract-data-rus`)
 - Warframe via Steam/Proton
 - Optional: `notify-send`, `hyprctl`
+
+OCR for relic rewards defaults to `rus+eng` (Russian client + English fallback). The catalog stores WFM `i18n.ru` names so Cyrillic OCR can match market items. In Settings set OCR lang to `rus`, `eng`, or `rus+eng`, then refresh the market catalog once so `name_ru` is cached.
 
 ## Quick start
 

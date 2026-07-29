@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct ItemRow {
     pub url_name: String,
     pub name: String,
+    #[serde(default)]
+    pub name_ru: Option<String>,
     pub thumb: Option<String>,
     pub ducats: Option<i64>,
     pub set_url_name: Option<String>,
@@ -27,6 +29,13 @@ pub struct InventoryItem {
     pub platinum: Option<f64>,
     pub ducats: Option<i64>,
     pub favorite: bool,
+    #[serde(default)]
+    pub thumb: Option<String>,
+    #[serde(default)]
+    pub vaulted: Option<bool>,
+    /// Mod / arcane rank from UpgradeFingerprint (`lvl`), max owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +44,26 @@ pub struct PriceCache {
     pub platinum: f64,
     pub volume: i64,
     pub updated_at: String,
+}
+
+/// Skip warframe.market refetch — order-book quotes stay fresh for one hour.
+pub const PRICE_FRESH_MINS: i64 = 60;
+/// Serve last known quote in UI after restart (persisted in SQLite `prices`).
+pub const PRICE_DISPLAY_MINS: i64 = 7 * 24 * 60;
+
+/// Fresh enough for the given TTL. Rejects sentinel dump timestamps.
+fn price_cache_usable(p: &PriceCache, max_age_mins: i64) -> bool {
+    if p.platinum <= 0.0 {
+        return false;
+    }
+    if p.updated_at.starts_with("2000-") {
+        return false;
+    }
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&p.updated_at) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc));
+    age.num_minutes() < max_age_mins && age.num_minutes() >= 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +94,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS items (
                 url_name TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                name_ru TEXT,
                 thumb TEXT,
                 ducats INTEGER,
                 set_url_name TEXT,
@@ -85,7 +115,8 @@ impl Database {
                 mastered INTEGER NOT NULL,
                 item_type TEXT NOT NULL,
                 url_name TEXT,
-                favorite INTEGER NOT NULL DEFAULT 0
+                favorite INTEGER NOT NULL DEFAULT 0,
+                rank INTEGER
             );
             CREATE TABLE IF NOT EXISTS favorites (
                 key TEXT PRIMARY KEY
@@ -105,23 +136,61 @@ impl Database {
                 filters_json TEXT NOT NULL,
                 order_mode TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS lotus_names (
+                unique_name TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'mod',
+                PRIMARY KEY (unique_name, kind)
+            );
             CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
             CREATE INDEX IF NOT EXISTS idx_stats_key ON stats(key);
             "#,
         )?;
+        // Additive migrations for older DBs
+        let _ = self.conn.execute("ALTER TABLE items ADD COLUMN name_ru TEXT", []);
+        let _ = self
+            .conn
+            .execute("CREATE INDEX IF NOT EXISTS idx_items_name_ru ON items(name_ru)", []);
+        let _ = self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS lotus_names (
+                unique_name TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'mod',
+                PRIMARY KEY (unique_name, kind)
+            );
+            "#,
+        );
+        // Migrate older DBs that used unique_name as sole PK (blocked weapon + weapon_en).
+        let _ = self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS lotus_names_v2 (
+                unique_name TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'mod',
+                PRIMARY KEY (unique_name, kind)
+            );
+            INSERT OR IGNORE INTO lotus_names_v2 (unique_name, display_name, kind)
+              SELECT unique_name, display_name, kind FROM lotus_names;
+            DROP TABLE IF EXISTS lotus_names;
+            ALTER TABLE lotus_names_v2 RENAME TO lotus_names;
+            "#,
+        );
+        let _ = self.conn.execute("ALTER TABLE inventory ADD COLUMN rank INTEGER", []);
         Ok(())
     }
 
     pub fn upsert_item(&self, item: &ItemRow) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO items (url_name, name, thumb, ducats, set_url_name, vaulted, mastery)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            r#"INSERT INTO items (url_name, name, name_ru, thumb, ducats, set_url_name, vaulted, mastery)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                ON CONFLICT(url_name) DO UPDATE SET
-                 name=excluded.name, thumb=excluded.thumb, ducats=excluded.ducats,
+                 name=excluded.name, name_ru=excluded.name_ru, thumb=excluded.thumb, ducats=excluded.ducats,
                  set_url_name=excluded.set_url_name, vaulted=excluded.vaulted, mastery=excluded.mastery"#,
             params![
                 item.url_name,
                 item.name,
+                item.name_ru,
                 item.thumb,
                 item.ducats,
                 item.set_url_name,
@@ -132,44 +201,79 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_items_batch(&self, items: &[ItemRow]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO items (url_name, name, name_ru, thumb, ducats, set_url_name, vaulted, mastery)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                   ON CONFLICT(url_name) DO UPDATE SET
+                     name=excluded.name, name_ru=excluded.name_ru, thumb=excluded.thumb, ducats=excluded.ducats,
+                     set_url_name=excluded.set_url_name, vaulted=excluded.vaulted, mastery=excluded.mastery"#,
+            )?;
+            for item in items {
+                stmt.execute(params![
+                    item.url_name,
+                    item.name,
+                    item.name_ru,
+                    item.thumb,
+                    item.ducats,
+                    item.set_url_name,
+                    item.vaulted.map(|v| if v { 1 } else { 0 }),
+                    item.mastery,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn item_count(&self) -> Result<usize> {
         let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?;
         Ok(n as usize)
     }
 
+    pub fn name_ru_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM items WHERE name_ru IS NOT NULL AND length(trim(name_ru)) > 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    fn map_item_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ItemRow> {
+        Ok(ItemRow {
+            url_name: r.get(0)?,
+            name: r.get(1)?,
+            name_ru: r.get(2)?,
+            thumb: r.get(3)?,
+            ducats: r.get(4)?,
+            set_url_name: r.get(5)?,
+            vaulted: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+            mastery: r.get(7)?,
+        })
+    }
+
     pub fn all_items(&self) -> Result<Vec<ItemRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url_name, name, thumb, ducats, set_url_name, vaulted, mastery FROM items",
+            "SELECT url_name, name, name_ru, thumb, ducats, set_url_name, vaulted, mastery FROM items",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(ItemRow {
-                url_name: r.get(0)?,
-                name: r.get(1)?,
-                thumb: r.get(2)?,
-                ducats: r.get(3)?,
-                set_url_name: r.get(4)?,
-                vaulted: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
-                mastery: r.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map([], Self::map_item_row)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn find_item_by_name(&self, name: &str) -> Result<Option<ItemRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT url_name, name, thumb, ducats, set_url_name, vaulted, mastery FROM items WHERE lower(name) = lower(?1) LIMIT 1",
+            r#"SELECT url_name, name, name_ru, thumb, ducats, set_url_name, vaulted, mastery
+               FROM items
+               WHERE lower(name) = lower(?1)
+                  OR (name_ru IS NOT NULL AND lower(name_ru) = lower(?1))
+               LIMIT 1"#,
         )?;
         let mut rows = stmt.query(params![name])?;
         if let Some(r) = rows.next()? {
-            return Ok(Some(ItemRow {
-                url_name: r.get(0)?,
-                name: r.get(1)?,
-                thumb: r.get(2)?,
-                ducats: r.get(3)?,
-                set_url_name: r.get(4)?,
-                vaulted: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
-                mastery: r.get(6)?,
-            }));
+            return Ok(Some(Self::map_item_row(r)?));
         }
         Ok(None)
     }
@@ -185,7 +289,45 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_prices_batch(&self, prices: &[PriceCache]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO prices (url_name, platinum, volume, updated_at)
+                   VALUES (?1, ?2, ?3, ?4)
+                   ON CONFLICT(url_name) DO UPDATE SET
+                     platinum=excluded.platinum, volume=excluded.volume, updated_at=excluded.updated_at"#,
+            )?;
+            for p in prices {
+                stmt.execute(params![p.url_name, p.platinum, p.volume, p.updated_at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(prices.len())
+    }
+
+    pub fn update_item_ducats_batch(&self, updates: &[(String, i64)]) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE items SET ducats = ?2 WHERE url_name = ?1")?;
+            for (url, ducats) in updates {
+                stmt.execute(params![url, ducats])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updates.len())
+    }
+
     pub fn list_all_prices(&self) -> Result<Vec<PriceCache>> {
+        self.list_prices_max_age(PRICE_DISPLAY_MINS)
+    }
+
+    /// Every stored quote, including ones older than the fresh window.
+    pub fn list_prices_raw(&self) -> Result<Vec<PriceCache>> {
         let mut stmt = self
             .conn
             .prepare("SELECT url_name, platinum, volume, updated_at FROM prices")?;
@@ -200,18 +342,50 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    pub fn list_prices_max_age(&self, max_age_mins: i64) -> Result<Vec<PriceCache>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT url_name, platinum, volume, updated_at FROM prices")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PriceCache {
+                url_name: r.get(0)?,
+                platinum: r.get(1)?,
+                volume: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter(|p| price_cache_usable(p, max_age_mins))
+            .collect())
+    }
+
+    /// Cached quote fresh enough to skip a WFM round-trip.
     pub fn get_price(&self, url_name: &str) -> Result<Option<PriceCache>> {
+        self.get_price_max_age(url_name, PRICE_FRESH_MINS)
+    }
+
+    /// Last known quote for UI (may be older than `PRICE_FRESH_MINS`).
+    pub fn get_price_cached(&self, url_name: &str) -> Result<Option<PriceCache>> {
+        self.get_price_max_age(url_name, PRICE_DISPLAY_MINS)
+    }
+
+    pub fn get_price_max_age(&self, url_name: &str, max_age_mins: i64) -> Result<Option<PriceCache>> {
         let mut stmt = self
             .conn
             .prepare("SELECT url_name, platinum, volume, updated_at FROM prices WHERE url_name=?1")?;
         let mut rows = stmt.query(params![url_name])?;
         if let Some(r) = rows.next()? {
-            return Ok(Some(PriceCache {
+            let p = PriceCache {
                 url_name: r.get(0)?,
                 platinum: r.get(1)?,
                 volume: r.get(2)?,
                 updated_at: r.get(3)?,
-            }));
+            };
+            if !price_cache_usable(&p, max_age_mins) {
+                return Ok(None);
+            }
+            return Ok(Some(p));
         }
         Ok(None)
     }
@@ -301,12 +475,13 @@ impl Database {
 
     pub fn upsert_inventory(&self, item: &InventoryItem) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO inventory (unique_name, name, count, xp, mastered, item_type, url_name, favorite)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            r#"INSERT INTO inventory (unique_name, name, count, xp, mastered, item_type, url_name, favorite, rank)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                ON CONFLICT(unique_name) DO UPDATE SET
                  name=excluded.name, count=excluded.count, xp=excluded.xp,
                  mastered=excluded.mastered, item_type=excluded.item_type,
-                 url_name=excluded.url_name, favorite=excluded.favorite"#,
+                 url_name=excluded.url_name, favorite=excluded.favorite,
+                 rank=excluded.rank"#,
             params![
                 item.unique_name,
                 item.name,
@@ -316,6 +491,7 @@ impl Database {
                 item.item_type,
                 item.url_name,
                 if item.favorite { 1 } else { 0 },
+                item.rank,
             ],
         )?;
         Ok(())
@@ -323,7 +499,7 @@ impl Database {
 
     pub fn list_inventory(&self) -> Result<Vec<InventoryItem>> {
         let mut stmt = self.conn.prepare(
-            "SELECT unique_name, name, count, xp, mastered, item_type, url_name, favorite FROM inventory ORDER BY name",
+            "SELECT unique_name, name, count, xp, mastered, item_type, url_name, favorite, rank FROM inventory ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(InventoryItem {
@@ -337,9 +513,30 @@ impl Database {
                 platinum: None,
                 ducats: None,
                 favorite: r.get::<_, i64>(7)? != 0,
+                thumb: None,
+                vaulted: None,
+                rank: r.get(8)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn ducats_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM items WHERE ducats IS NOT NULL AND ducats > 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    pub fn vaulted_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM items WHERE vaulted = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     pub fn inventory_count(&self) -> Result<usize> {
@@ -432,5 +629,75 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn lotus_name_count(&self, kind: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM lotus_names WHERE kind=?1",
+            params![kind],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// True if a sample of display_name values contains Cyrillic (DE Export ru).
+    pub fn lotus_names_look_russian(&self, kind: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT display_name FROM lotus_names WHERE kind=?1 LIMIT 30",
+        )?;
+        let rows = stmt.query_map(params![kind], |r| r.get::<_, String>(0))?;
+        let mut cyr = 0usize;
+        let mut n = 0usize;
+        for row in rows.flatten() {
+            n += 1;
+            if row.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)) {
+                cyr += 1;
+            }
+        }
+        Ok(n > 0 && cyr * 2 >= n)
+    }
+
+    pub fn replace_lotus_names(&self, kind: &str, rows: &[(String, String)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM lotus_names WHERE kind=?1", params![kind])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO lotus_names (unique_name, display_name, kind) VALUES (?1, ?2, ?3)",
+            )?;
+            for (unique, name) in rows {
+                stmt.execute(params![unique, name, kind])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// uniqueName (without inventory `#suffix`) → English display name from WFCD.
+    pub fn lotus_name_map(&self, kind: &str) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT unique_name, display_name FROM lotus_names WHERE kind=?1")?;
+        let rows = stmt.query_map(params![kind], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows.flatten() {
+            map.insert(row.0, row.1);
+        }
+        Ok(map)
+    }
+
+    pub fn lotus_name_map_all(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT unique_name, display_name FROM lotus_names")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows.flatten() {
+            map.insert(row.0, row.1);
+        }
+        Ok(map)
     }
 }

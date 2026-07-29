@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use axum::extract::{
     ws::{Message, WebSocket, WebSocketUpgrade},
-    Path, State,
+    Path, Query, State,
 };
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -46,6 +46,8 @@ pub fn router(services: Arc<Services>) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/profile", get(player_profile))
+        .route("/img", get(cached_image))
         .route("/config", get(get_config).post(update_config))
         .route("/ws", get(ws_handler))
         .route("/rewards", get(list_rewards))
@@ -61,6 +63,7 @@ pub fn router(services: Arc<Services>) -> Router {
         .route("/market/signin", post(market_signin))
         .route("/market/jwt", post(market_jwt))
         .route("/market/orders", get(market_orders))
+        .route("/market/orders/item/{url_name}", get(market_item_orders))
         .route("/market/orders/create", post(market_create))
         .route("/market/suggestions", get(market_suggestions))
         .route("/rivens/analyze", post(riven_analyze))
@@ -72,6 +75,9 @@ pub fn router(services: Arc<Services>) -> Router {
         .route("/overlay", get(overlay_state))
         .route("/items/refresh", post(refresh_items))
         .route("/prices/refresh", post(refresh_prices))
+        .route("/prices/item/{url_name}", get(price_item))
+        .route("/worldstate", get(worldstate))
+        .route("/mastery/sets", get(mastery_sets))
         .with_state(services.clone());
 
     let pages = Router::new()
@@ -198,6 +204,90 @@ async fn status(State(services): State<Arc<Services>>) -> impl IntoResponse {
     Json(s)
 }
 
+async fn player_profile(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        services
+            .inventory
+            .player_profile()
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ImgQuery {
+    /// Remote image URL to cache & serve.
+    u: String,
+}
+
+async fn cached_image(
+    State(services): State<Arc<Services>>,
+    Query(q): Query<ImgQuery>,
+) -> Result<Response, ApiError> {
+    let url = q.u.trim();
+    if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(ApiError::msg("u must be an http(s) URL"));
+    }
+    // Basic SSRF guard — only known Warframe / market CDNs
+    if !is_allowed_image_host(url) {
+        return Err(ApiError::msg("image host not allowed"));
+    }
+    let path = services
+        .imgcache
+        .ensure(url)
+        .await
+        .map_err(ApiError::from)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    let ct = bngframe_core::imgcache::content_type_for_path(&path);
+    Ok((
+        [
+            (header::CONTENT_TYPE, ct),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn is_allowed_image_host(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    matches!(
+        host.as_str(),
+        "warframe.market"
+            | "cdn.warframestat.us"
+            | "wiki.warframe.com"
+            | "static.wikia.nocookie.net"
+            | "content.warframe.com"
+            | "content-ps4.warframe.com"
+            | "content-xb1.warframe.com"
+            | "content-swi.warframe.com"
+    ) || host.ends_with(".warframe.com")
+        || host.ends_with(".warframestat.us")
+        || host.ends_with(".nocookie.net")
+}
+
 async fn get_config(State(services): State<Arc<Services>>) -> impl IntoResponse {
     let cfg = services.cfg.read().await.clone();
     // redact jwt
@@ -217,6 +307,7 @@ struct ConfigPatch {
     monitor: Option<String>,
     wfmarket_jwt: Option<String>,
     auto_open_browser: Option<bool>,
+    focus_overlay_workspace: Option<bool>,
     ui_lang: Option<String>,
 }
 
@@ -246,6 +337,9 @@ async fn update_config(
     if let Some(v) = patch.auto_open_browser {
         cfg.auto_open_browser = v;
     }
+    if let Some(v) = patch.focus_overlay_workspace {
+        cfg.focus_overlay_workspace = v;
+    }
     let mut ui_lang_to_set: Option<String> = None;
     if let Some(v) = patch.ui_lang {
         if v == "ru" || v == "en" {
@@ -253,6 +347,8 @@ async fn update_config(
             ui_lang_to_set = Some(v);
         }
     }
+    let focus_ws = cfg.focus_overlay_workspace;
+    let auto_open = cfg.auto_open_browser;
     cfg.save().map_err(ApiError::from)?;
     {
         let mut s = services.state.status.write().await;
@@ -262,6 +358,8 @@ async fn update_config(
         s.eelog_exists = cfg.eelog_exists();
     }
     drop(cfg);
+    services.overlay.set_focus_overlay_workspace(focus_ws);
+    services.overlay.set_auto_open_browser(auto_open);
     if let Some(v) = ui_lang_to_set {
         services.overlay.set_ui_lang(&v).await;
     }
@@ -288,6 +386,29 @@ async fn list_inventory(State(services): State<Arc<Services>>) -> Result<impl In
         .list_enriched()
         .await
         .map_err(ApiError::from)?;
+
+    // Warm WFM thumbs for visible market items (local disk cache)
+    {
+        let img = services.imgcache.clone();
+        let mut urls: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for item in &resp.items {
+            if let Some(ref t) = item.thumb {
+                let u = bngframe_core::pricing::wfm_thumb_url(t);
+                if seen.insert(u.clone()) {
+                    urls.push(u);
+                }
+            }
+        }
+        // Cap per request so inventory load stays snappy
+        urls.truncate(120);
+        if !urls.is_empty() {
+            tokio::spawn(async move {
+                img.warm(urls).await;
+            });
+        }
+    }
+
     Ok(Json(resp))
 }
 
@@ -462,6 +583,18 @@ async fn market_orders(State(services): State<Arc<Services>>) -> Result<impl Int
     Ok(Json(orders))
 }
 
+async fn market_item_orders(
+    State(services): State<Arc<Services>>,
+    Path(url_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let orders = services
+        .market
+        .item_orders(&url_name)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(orders))
+}
+
 #[derive(Deserialize)]
 struct CreateOrderBody {
     item_url_name: String,
@@ -557,18 +690,50 @@ async fn languages() -> impl IntoResponse {
     Json(AnalyticsService::language_matrix())
 }
 
+async fn worldstate(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        services
+            .worldstate
+            .snapshot()
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+async fn mastery_sets(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
+    // Fast path: cached catalog + inventory only. Live WFM prices warm on the client.
+    Ok(Json(
+        services.mastery.list_sets().await.map_err(ApiError::from)?,
+    ))
+}
+
+async fn price_item(
+    State(services): State<Arc<Services>>,
+    Path(url_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cache = services
+        .pricing
+        .price_for(&url_name)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(cache))
+}
+
 async fn overlay_state(State(services): State<Arc<Services>>) -> impl IntoResponse {
     Json(services.overlay.current().await)
 }
 
 async fn overlay_page(State(services): State<Arc<Services>>) -> Response {
-    let payload = services.overlay.current().await;
-    if let Some(path) = payload.html_path {
-        if let Ok(html) = std::fs::read_to_string(path) {
-            return Html(html).into_response();
-        }
-    }
-    Html("<html><body style='background:#111;color:#ddd;font-family:sans-serif;padding:2rem'>No overlay active. Trigger a reward scan.</body></html>").into_response()
+    // Always serve the live shell — it pulls current rewards from /api/overlay.
+    let html = services.overlay.live_page_html().await;
+    (
+        [
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+        ],
+        Html(html),
+    )
+        .into_response()
 }
 
 async fn refresh_items(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {

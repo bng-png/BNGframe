@@ -18,11 +18,16 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub web_dir: Option<PathBuf>,
     pub ocr_lang: String,
+    /// OCR backend: "auto" (RapidOCR if models present, else Tesseract),
+    /// "rapidocr", or "tesseract".
+    pub ocr_engine: String,
     pub inventory_consent: bool,
     pub wfmarket_jwt: Option<String>,
     pub monitor: Option<String>,
     pub overlay_enabled: bool,
     pub auto_open_browser: bool,
+    /// After OCR succeeds, switch Hyprland to the workspace with the overlay browser.
+    pub focus_overlay_workspace: bool,
     /// UI / overlay language: "ru" or "en"
     pub ui_lang: String,
 }
@@ -43,12 +48,14 @@ impl Default for Config {
             data_dir,
             cache_dir,
             web_dir: None,
-            ocr_lang: "eng".into(),
+            ocr_lang: "rus+eng".into(),
+            ocr_engine: "auto".into(),
             inventory_consent: false,
             wfmarket_jwt: None,
             monitor: None,
             overlay_enabled: true,
             auto_open_browser: false,
+            focus_overlay_workspace: false,
             ui_lang: "ru".into(),
         }
     }
@@ -60,6 +67,37 @@ impl Config {
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".config"))
             .join("bngframe")
             .join("config.toml")
+    }
+
+    /// OCR language pack for Tesseract.
+    /// Soft-migrates legacy `eng` → `rus+eng` when UI is Russian (typical RU game client).
+    pub fn effective_ocr_lang(&self) -> String {
+        let lang = self.ocr_lang.trim();
+        if lang.is_empty() {
+            return if self.ui_lang.eq_ignore_ascii_case("ru") {
+                "rus+eng".into()
+            } else {
+                "eng".into()
+            };
+        }
+        if lang.eq_ignore_ascii_case("eng") && self.ui_lang.eq_ignore_ascii_case("ru") {
+            return "rus+eng".into();
+        }
+        lang.to_string()
+    }
+
+    /// Prefer RapidOCR when models are installed (or forced via config).
+    pub fn use_rapidocr(&self) -> bool {
+        match self.ocr_engine.trim().to_ascii_lowercase().as_str() {
+            "tesseract" => false,
+            "rapidocr" => true,
+            _ => crate::rapidocr::models_available(),
+        }
+    }
+
+    pub fn prefer_russian_names(&self) -> bool {
+        self.ui_lang.eq_ignore_ascii_case("ru")
+            || self.effective_ocr_lang().contains("rus")
     }
 
     pub fn load() -> Result<Self> {

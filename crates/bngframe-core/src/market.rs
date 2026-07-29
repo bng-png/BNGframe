@@ -17,6 +17,13 @@ pub struct MarketOrder {
     pub platinum: f64,
     pub quantity: i64,
     pub visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Mod / arcane rank (0–5 for mystics). Absent for items without ranks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,9 +144,62 @@ impl MarketService {
                         platinum: o.get("platinum").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         quantity: o.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1),
                         visible: o.get("visible").and_then(|v| v.as_bool()).unwrap_or(true),
+                        user: None,
+                        status: None,
+                        rank: order_rank(o),
                     });
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// Public orders for an item (no JWT). Prefer online/ingame sellers for WTS.
+    pub async fn item_orders(&self, url_name: &str) -> Result<Vec<MarketOrder>> {
+        let url = format!("https://api.warframe.market/v2/orders/item/{url_name}");
+        let resp = self
+            .client
+            .get(&url)
+            .header("Language", "ru")
+            .header("Platform", "pc")
+            .send()
+            .await
+            .context("WFM item orders")?;
+        if !resp.status().is_success() {
+            bail!("item orders fetch {}", resp.status());
+        }
+        let body: Value = resp.json().await?;
+        let arr = body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for o in arr {
+            let order_type = o
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sell")
+                .to_string();
+            let user = o
+                .pointer("/user/ingameName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let status = o
+                .pointer("/user/status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            out.push(MarketOrder {
+                id: o.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                item_url_name: url_name.into(),
+                order_type,
+                platinum: o.get("platinum").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                quantity: o.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1),
+                visible: o.get("visible").and_then(|v| v.as_bool()).unwrap_or(true),
+                user,
+                status,
+                rank: order_rank(&o),
+            });
         }
         Ok(out)
     }
@@ -188,7 +248,13 @@ impl MarketService {
         };
         let mut suggestions = Vec::new();
         for item in inv {
-            if item.count > 1 && item.item_type != "warframe" && item.item_type != "weapon" {
+            if item.count > 1
+                && item.item_type != "warframe"
+                && item.item_type != "weapon"
+                && item.item_type != "primary"
+                && item.item_type != "secondary"
+                && item.item_type != "melee"
+            {
                 let mut suggested = None;
                 if let Some(ref url) = item.url_name {
                     if let Ok(Some(p)) = self.db.lock().await.get_price(url) {
@@ -211,4 +277,10 @@ impl MarketService {
         });
         Ok(suggestions.into_iter().take(50).collect())
     }
+}
+
+fn order_rank(o: &Value) -> Option<i64> {
+    o.get("rank")
+        .or_else(|| o.get("mod_rank"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
 }

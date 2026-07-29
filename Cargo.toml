@@ -34,6 +34,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+xz2 = "0.1"
 walkdir = "2"
 bngframe-core = { path = "crates/bngframe-core" }
 bngframe-capture = { path = "crates/bngframe-capture" }
