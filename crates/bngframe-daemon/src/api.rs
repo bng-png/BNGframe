@@ -7,7 +7,7 @@ use axum::extract::{
 };
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -62,9 +62,13 @@ pub fn router(services: Arc<Services>) -> Router {
         .route("/relics/recommend", get(relic_recommend))
         .route("/market/signin", post(market_signin))
         .route("/market/jwt", post(market_jwt))
+        .route("/market/auth", get(market_auth))
+        .route("/market/status", get(market_auth).post(market_set_status))
         .route("/market/orders", get(market_orders))
         .route("/market/orders/item/{url_name}", get(market_item_orders))
         .route("/market/orders/create", post(market_create))
+        .route("/market/orders/{order_id}", delete(market_delete_order))
+        .route("/market/orders/{order_id}/close", post(market_close_order))
         .route("/market/suggestions", get(market_suggestions))
         .route("/rivens/analyze", post(riven_analyze))
         .route("/rivens/compare", post(riven_compare))
@@ -232,24 +236,20 @@ async fn cached_image(
     if !is_allowed_image_host(url) {
         return Err(ApiError::msg("image host not allowed"));
     }
-    let path = services
+    let img = services
         .imgcache
-        .ensure(url)
+        .get(url)
         .await
         .map_err(ApiError::from)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
-    let ct = bngframe_core::imgcache::content_type_for_path(&path);
     Ok((
         [
-            (header::CONTENT_TYPE, ct),
+            (header::CONTENT_TYPE, img.content_type),
             (
                 header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable",
             ),
         ],
-        bytes,
+        img.bytes.as_ref().clone(),
     )
         .into_response())
 }
@@ -278,6 +278,7 @@ fn is_allowed_image_host(url: &str) -> bool {
         "warframe.market"
             | "cdn.warframestat.us"
             | "wiki.warframe.com"
+            | "warframe.fandom.com"
             | "static.wikia.nocookie.net"
             | "content.warframe.com"
             | "content-ps4.warframe.com"
@@ -387,13 +388,31 @@ async fn list_inventory(State(services): State<Arc<Services>>) -> Result<impl In
         .await
         .map_err(ApiError::from)?;
 
-    // Warm WFM thumbs for visible market items (local disk cache)
+    // Warm shared icons + non-relic WFM thumbs (relics use 5 tier wiki icons in UI).
     {
         let img = services.imgcache.clone();
-        let mut urls: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut urls: Vec<String> = vec![
+            "https://wiki.warframe.com/images/LithRelicIntact.png".into(),
+            "https://wiki.warframe.com/images/MesoRelicIntact.png".into(),
+            "https://wiki.warframe.com/images/NeoRelicIntact.png".into(),
+            "https://wiki.warframe.com/images/AxiRelicIntact.png".into(),
+            "https://wiki.warframe.com/images/RequiemRelicIntact.png".into(),
+        ];
+        let mut seen: std::collections::HashSet<String> = urls.iter().cloned().collect();
         for item in &resp.items {
+            let is_relic = item.item_type == "relic"
+                || item
+                    .thumb
+                    .as_deref()
+                    .map(|t| t.contains("_relic."))
+                    .unwrap_or(false);
+            if is_relic {
+                continue;
+            }
             if let Some(ref t) = item.thumb {
+                if t.contains("unknown.thumb") {
+                    continue;
+                }
                 let u = bngframe_core::pricing::wfm_thumb_url(t);
                 if seen.insert(u.clone()) {
                     urls.push(u);
@@ -401,7 +420,7 @@ async fn list_inventory(State(services): State<Arc<Services>>) -> Result<impl In
             }
         }
         // Cap per request so inventory load stays snappy
-        urls.truncate(120);
+        urls.truncate(125);
         if !urls.is_empty() {
             tokio::spawn(async move {
                 img.warm(urls).await;
@@ -577,10 +596,52 @@ async fn market_jwt(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn market_orders(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
+async fn market_auth(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
     let cfg = services.cfg.read().await.clone();
-    let orders = services.market.my_orders(&cfg).await.map_err(ApiError::from)?;
+    let state = services
+        .market
+        .auth_state(&cfg)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(state))
+}
+
+#[derive(Deserialize)]
+struct MarketStatusBody {
+    status: String,
+}
+
+async fn market_set_status(
+    State(services): State<Arc<Services>>,
+    Json(body): Json<MarketStatusBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cfg = services.cfg.read().await.clone();
+    let state = services
+        .market
+        .set_status(&cfg, &body.status)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(state))
+}
+
+async fn market_orders(
+    State(services): State<Arc<Services>>,
+    Query(q): Query<MarketOrdersQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cfg = services.cfg.read().await.clone();
+    let force = q.refresh.unwrap_or(false);
+    let orders = services
+        .market
+        .my_orders_cached(&cfg, force)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(orders))
+}
+
+#[derive(Deserialize)]
+struct MarketOrdersQuery {
+    #[serde(default)]
+    refresh: Option<bool>,
 }
 
 async fn market_item_orders(
@@ -601,6 +662,8 @@ struct CreateOrderBody {
     order_type: String,
     platinum: i64,
     quantity: i64,
+    #[serde(default)]
+    rank: Option<i64>,
 }
 
 async fn market_create(
@@ -616,19 +679,76 @@ async fn market_create(
             &body.order_type,
             body.platinum,
             body.quantity,
+            body.rank,
         )
         .await
         .map_err(ApiError::from)?;
     Ok(Json(v))
 }
 
+async fn market_delete_order(
+    State(services): State<Arc<Services>>,
+    Path(order_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cfg = services.cfg.read().await.clone();
+    services
+        .market
+        .delete_order(&cfg, &order_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CloseOrderBody {
+    #[serde(default)]
+    quantity: Option<i64>,
+}
+
+async fn market_close_order(
+    State(services): State<Arc<Services>>,
+    Path(order_id): Path<String>,
+    Json(body): Json<CloseOrderBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cfg = services.cfg.read().await.clone();
+    let orders = services
+        .market
+        .my_orders(&cfg)
+        .await
+        .map_err(ApiError::from)?;
+    let meta = orders.iter().find(|o| o.id == order_id).cloned();
+    let quantity = body
+        .quantity
+        .filter(|q| *q > 0)
+        .or_else(|| meta.as_ref().map(|o| o.quantity))
+        .unwrap_or(1);
+
+    let v = services
+        .market
+        .close_order(&cfg, &order_id, quantity)
+        .await
+        .map_err(ApiError::from)?;
+
+    if let Some(o) = meta {
+        let delta = if o.order_type == "buy" {
+            -(o.platinum * quantity as f64)
+        } else {
+            o.platinum * quantity as f64
+        };
+        let _ = services.stats.record_trade(delta).await;
+    }
+
+    Ok(Json(v))
+}
+
 async fn market_suggestions(
     State(services): State<Arc<Services>>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let prefer_ru = services.cfg.read().await.prefer_russian_names();
     Ok(Json(
         services
             .market
-            .suggest_listings()
+            .suggest_listings(prefer_ru)
             .await
             .map_err(ApiError::from)?,
     ))
@@ -690,14 +810,24 @@ async fn languages() -> impl IntoResponse {
     Json(AnalyticsService::language_matrix())
 }
 
-async fn worldstate(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
+async fn worldstate(
+    State(services): State<Arc<Services>>,
+    Query(q): Query<WorldstateQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let force = q.refresh.unwrap_or(false);
     Ok(Json(
         services
             .worldstate
-            .snapshot()
+            .snapshot_cached(force)
             .await
             .map_err(ApiError::from)?,
     ))
+}
+
+#[derive(Deserialize)]
+struct WorldstateQuery {
+    #[serde(default)]
+    refresh: Option<bool>,
 }
 
 async fn mastery_sets(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {

@@ -1,6 +1,8 @@
 import { WikiImg } from './WikiImg'
 import {
   partVisualFromSlug,
+  relicTierFromText,
+  relicTierImageUrls,
   rolePartFile,
   wikiFileUrls,
   wikiUrlForName,
@@ -46,7 +48,32 @@ export function thumbFromItem(opts: {
   role?: string | null
   /** Mods (and similar) must not be treated as frame/weapon parts. */
   skipPartRole?: boolean
+  /** Void relics: one shared icon per Lith/Meso/Neo/Axi/Requiem. */
+  isRelic?: boolean
 }): { visual: PartVisual; mainUrls: string[]; partUrls: string[]; tone: 'prime' | 'normal' | null } {
+  // All Axi (etc.) share the same art — don't fetch hundreds of unique WFM thumb URLs.
+  const looksRelic =
+    !!opts.isRelic ||
+    /(?:^|_)relic$/i.test(opts.urlName || '') ||
+    /реликви|(?:^|\s)relic(?:\s|$)/i.test(opts.name || '')
+  if (looksRelic) {
+    const tier = relicTierFromText(opts.urlName, opts.name)
+    const tierUrls = tier ? relicTierImageUrls(tier) : []
+    return {
+      visual: {
+        isPart: false,
+        role: null,
+        mainFile: tier ? `${tier}RelicIntact.png` : null,
+        partFile: null,
+        mainUrls: tierUrls,
+        partUrls: [],
+      },
+      mainUrls: tierUrls,
+      partUrls: [],
+      tone: null,
+    }
+  }
+
   const visual = opts.skipPartRole
     ? {
         isPart: false,
@@ -61,15 +88,23 @@ export function thumbFromItem(opts: {
     ? opts.name.replace(/:.+$/, '').replace(/\([^)]*\)/g, '').trim()
     : ''
   const nameUrls = parentName ? wikiUrlForName(parentName) : []
-  const mainUrls = [...new Set([...visual.mainUrls, ...nameUrls, ...(opts.wfmThumbUrl ? [opts.wfmThumbUrl] : [])])]
   const blob = `${opts.urlName || ''} ${opts.name || ''}`.toLowerCase()
   const isPrime = /prime|прайм/.test(blob)
   const looksLikePart =
     !opts.skipPartRole &&
     (visual.isPart ||
-      /чертеж|blueprint|приёмник|приемник|панцир|ствол|каркас|систем|мозг|связь|приклад|клинок|рукоят|cerebrum|carapace|receiver|barrel/.test(
+      /чертеж|blueprint|приёмник|приемник|панцир|ствол|каркас|систем|мозг|связь|приклад|клинок|рукоят|нейро|neuroptic|cerebrum|carapace|receiver|barrel|helmet/.test(
         blob,
       ))
+
+  // Part WFM thumbs are often tiny shared placeholders (e.g. Sevagoth) — prefer parent art first.
+  const mainUrls = [
+    ...new Set(
+      looksLikePart || visual.isPart
+        ? [...visual.mainUrls, ...nameUrls, ...(opts.wfmThumbUrl ? [opts.wfmThumbUrl] : [])]
+        : [...(opts.wfmThumbUrl ? [opts.wfmThumbUrl] : []), ...visual.mainUrls, ...nameUrls],
+    ),
+  ]
 
   let tone: 'prime' | 'normal' | null = null
   if (looksLikePart) tone = isPrime ? 'prime' : 'normal'
@@ -101,9 +136,14 @@ export function thumbFromSet(opts: {
   name?: string | null
   wfmThumbUrl?: string | null
 }): string[] {
-  const cleanRu = (opts.name || '').replace(/<[^>]+>\s*/g, '').trim()
-  const fromName = cleanRu ? wikiUrlForName(cleanRu) : []
-  // English slug from set_key is the reliable wiki filename (Aklato.png)
+  const cleanRu = (opts.name || '')
+    .replace(/<[^>]+>\s*/g, '')
+    .replace(/^<ARCHWING>\s*/i, '')
+    .trim()
+  // Prefer market set slug / public set_key (atlas.png), not internal Lotus leaves.
+  const fromUrl = opts.urlName
+    ? partVisualFromSlug(opts.urlName.replace(/_set$/, '')).mainUrls
+    : []
   const fromKey = wikiFileUrls(
     `${opts.setKey
       .split('_')
@@ -111,14 +151,13 @@ export function thumbFromSet(opts: {
       .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
       .join('')}.png`,
   )
-  const fromUrl = opts.urlName
-    ? partVisualFromSlug(opts.urlName.replace(/_set$/, '')).mainUrls
-    : []
+  // RU display names often don't match wiki filenames; try after EN slug candidates.
+  const fromName = cleanRu ? wikiUrlForName(cleanRu) : []
   return [
     ...new Set([
       ...(opts.wfmThumbUrl ? [opts.wfmThumbUrl] : []),
-      ...fromKey,
       ...fromUrl,
+      ...fromKey,
       ...fromName,
     ]),
   ]

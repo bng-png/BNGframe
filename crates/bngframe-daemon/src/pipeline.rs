@@ -605,74 +605,19 @@ impl RewardPipeline {
             );
         }
 
-        // Live WFM prices in background — overlay only, no third notify.
-        let urls: Vec<String> = reward
-            .slots
-            .iter()
-            .filter_map(|s| s.matched_url_name.clone())
-            .collect();
-        if !urls.is_empty() {
-            let pricing = self.pricing.clone();
-            let overlay = self.overlay.clone();
-            let state = self.state.clone();
-            let mut reward_bg = reward.clone();
-            tokio::spawn(async move {
-                for slot in &mut reward_bg.slots {
-                    let Some(ref url) = slot.matched_url_name else {
-                        continue;
-                    };
-                    if let Ok(p) = pricing.price_for_refresh(url).await {
-                        if p.platinum > 0.0 {
-                            slot.platinum = Some(p.platinum);
-                            slot.volume = Some(p.volume);
-                        }
-                    }
-                }
-                rank_slots(&mut reward_bg.slots);
-                reward_bg.best_index = reward_bg
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.rank.unwrap_or(99))
-                    .map(|(i, _)| i);
-                state.push_reward(reward_bg.clone()).await;
-                if let Err(e) = overlay.update_rewards(&reward_bg).await {
-                    warn!("price-refresh overlay: {e}");
-                }
-                info!("Overlay live prices refreshed (silent) for {}", reward_bg.id);
-            });
-        }
-
         Ok(reward)
     }
 
     async fn slot_from_item(&self, item: &ItemRow, prefer_ru: bool) -> RewardSlot {
         let mut platinum = None;
         let mut volume = None;
-        // Forma is not traded on WFM — skip the orders call.
+        // OCR notifications use the local cache only — no live WFM round-trip.
+        // Prime-part quotes are refreshed on daemon startup (avg of 3 cheapest).
         if item.url_name != "forma" {
-            match self.pricing.price_for_refresh(&item.url_name).await {
-                Ok(p) if p.platinum > 0.0 => {
+            if let Some(p) = self.pricing.price_cached_only(&item.url_name).await {
+                if p.platinum > 0.0 {
                     platinum = Some(p.platinum);
                     volume = Some(p.volume);
-                }
-                Ok(_) => {
-                    // Empty book / 404 — fall back to last warm cache if any.
-                    if let Some(p) = self.pricing.price_cached_only(&item.url_name).await {
-                        if p.platinum > 0.0 {
-                            platinum = Some(p.platinum);
-                            volume = Some(p.volume);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("live price for {}: {e}", item.url_name);
-                    if let Some(p) = self.pricing.price_cached_only(&item.url_name).await {
-                        if p.platinum > 0.0 {
-                            platinum = Some(p.platinum);
-                            volume = Some(p.volume);
-                        }
-                    }
                 }
             }
         }

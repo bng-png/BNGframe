@@ -5,6 +5,7 @@ import { PlatAmount, DucatAmount, PlatIcon } from './Currency'
 import { UnvaultedIcon, VaultedIcon } from './StatusIcons'
 import { roleFromDisplayName } from '../wikiImages'
 import { isArcaneItem, isModItem, isRelicItem, isSetPartItem } from '../itemClass'
+import type { ReactNode } from 'react'
 
 const ROLE_LABEL: Record<string, string> = {
   blueprint: 'BP',
@@ -25,11 +26,16 @@ export function ItemCard({
   item,
   onWts,
   onWtb,
+  onSelect,
   labels,
+  actions,
+  rankEdit,
 }: {
   item: InventoryItem
   onWts?: () => void
   onWtb?: () => void
+  /** Open market order book (right rail). */
+  onSelect?: () => void
   labels: {
     owned: string
     mastered?: string
@@ -51,16 +57,26 @@ export function ItemCard({
     typeWarframe: string
     typeBlueprint: string
   }
+  /** Replace default WTS/WTB buttons (e.g. market Sold/Remove / List). */
+  actions?: ReactNode
+  /** Editable rank for mods/arcanes when listing. */
+  rankEdit?: {
+    value: number
+    max: number
+    onChange: (n: number) => void
+  }
 }) {
   const isMod = isModItem(item)
   const isArcane = isArcaneItem(item)
-  const skipRole = isMod || isArcane || isRelicItem(item)
+  const isRelic = isRelicItem(item)
+  const skipRole = isMod || isArcane || isRelic
   const wfm = wfmThumbUrl(item.thumb)
   const { visual, mainUrls, partUrls, tone } = thumbFromItem({
     urlName: item.url_name,
     name: item.name,
     wfmThumbUrl: wfm,
     skipPartRole: skipRole,
+    isRelic,
   })
   const platLabel = item.platinum != null ? Math.round(item.platinum) : null
   const role = skipRole ? null : visual.role || roleFromDisplayName(item.name)
@@ -82,7 +98,7 @@ export function ItemCard({
     ? labels.typeArcane
     : isMod
       ? labels.typeMod
-      : isRelicItem(item)
+      : isRelic
         ? labels.typeRelic
         : tone === 'prime'
           ? role
@@ -96,7 +112,19 @@ export function ItemCard({
 
   return (
     <article
-      className={`item-card${item.mastered || item.count > 0 ? ' owned' : ''}${tone === 'prime' ? ' prime' : ''}`}
+      className={`item-card${item.mastered || item.count > 0 ? ' owned' : ''}${tone === 'prime' ? ' prime' : ''}${onSelect && item.url_name ? ' clickable' : ''}`}
+      onClick={() => {
+        if (onSelect && item.url_name) onSelect()
+      }}
+      role={onSelect && item.url_name ? 'button' : undefined}
+      tabIndex={onSelect && item.url_name ? 0 : undefined}
+      onKeyDown={(e) => {
+        if (!onSelect || !item.url_name) return
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onSelect()
+        }
+      }}
     >
       <PartThumb
         urls={mainUrls}
@@ -106,13 +134,14 @@ export function ItemCard({
       />
       <div className="item-body">
         <div className="item-title">{item.name}</div>
+        {item.name_en ? <div className="item-title-alt">{item.name_en}</div> : null}
         <div className="item-meta">
           <span>
             {labels.qty} ×{item.count}
           </span>
           {(isMod || isArcane) && (
             <span className="tag rank" title={labels.rank}>
-              R{item.rank ?? 0}
+              R{rankEdit ? rankEdit.value : (item.rank ?? 0)}
             </span>
           )}
           <PlatAmount value={item.platinum} />
@@ -127,14 +156,36 @@ export function ItemCard({
           <span className={`tag${!skipRole && tone === 'prime' ? ' prime' : ''}`}>{typeTag}</span>
         </div>
       </div>
-      <div className="item-actions">
-        <button className="btn sell" type="button" disabled={!item.url_name} onClick={onWts}>
-          {labels.wts} {platLabel != null ? platLabel : ''}
-          {platLabel != null && <PlatIcon className="currency-ico" />}
-        </button>
-        <button className="btn buy" type="button" disabled={!item.url_name} onClick={onWtb}>
-          {labels.wtb}
-        </button>
+      <div className="item-actions" onClick={(e) => e.stopPropagation()}>
+        {rankEdit && (isMod || isArcane) && (
+          <label className="rank-edit">
+            {labels.rank}
+            <input
+              type="number"
+              min={0}
+              max={rankEdit.max}
+              value={rankEdit.value}
+              onChange={(e) => {
+                const n = Number(e.target.value)
+                const max = rankEdit.max
+                rankEdit.onChange(
+                  Number.isFinite(n) ? Math.max(0, Math.min(max, Math.round(n))) : 0,
+                )
+              }}
+            />
+          </label>
+        )}
+        {actions ?? (
+          <>
+            <button className="btn sell" type="button" disabled={!item.url_name} onClick={onWts}>
+              {labels.wts} {platLabel != null ? platLabel : ''}
+              {platLabel != null && <PlatIcon className="currency-ico" />}
+            </button>
+            <button className="btn buy" type="button" disabled={!item.url_name} onClick={onWtb}>
+              {labels.wtb}
+            </button>
+          </>
+        )}
       </div>
     </article>
   )

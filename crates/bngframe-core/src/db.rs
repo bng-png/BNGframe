@@ -278,6 +278,18 @@ impl Database {
         Ok(None)
     }
 
+    pub fn get_item(&self, url_name: &str) -> Result<Option<ItemRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT url_name, name, name_ru, thumb, ducats, set_url_name, vaulted, mastery
+               FROM items WHERE url_name = ?1 LIMIT 1"#,
+        )?;
+        let mut rows = stmt.query(params![url_name])?;
+        if let Some(r) = rows.next()? {
+            return Ok(Some(Self::map_item_row(r)?));
+        }
+        Ok(None)
+    }
+
     pub fn upsert_price(&self, p: &PriceCache) -> Result<()> {
         self.conn.execute(
             r#"INSERT INTO prices (url_name, platinum, volume, updated_at)

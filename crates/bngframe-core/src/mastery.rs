@@ -1,11 +1,15 @@
 //! Mastery / set progress grouping for AlecaFrame-style SetCards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::debug;
 
 use crate::db::{Database, InventoryItem, ItemRow};
 use crate::pricing::{
@@ -23,6 +27,9 @@ pub struct SetPartProgress {
     pub required: i64,
     pub url_name: Option<String>,
     pub name: Option<String>,
+    /// WFM relative thumb path (same as items.thumb).
+    #[serde(default)]
+    pub thumb: Option<String>,
 }
 
 fn default_part_required() -> i64 {
@@ -57,15 +64,90 @@ pub struct MasterySetsResponse {
 pub struct MasteryService {
     db: Arc<Mutex<Database>>,
     pricing: Arc<PricingService>,
+    cache: Mutex<Option<CachedMasterySets>>,
 }
+
+struct CachedMasterySets {
+    fingerprint: u64,
+    built_at: Instant,
+    response: MasterySetsResponse,
+}
+
+/// Reuse computed mastery for a short window while inventory is unchanged.
+const MASTERY_CACHE_TTL: Duration = Duration::from_secs(90);
 
 impl MasteryService {
     pub fn new(db: Arc<Mutex<Database>>, pricing: Arc<PricingService>) -> Self {
-        Self { db, pricing }
+        Self {
+            db,
+            pricing,
+            cache: Mutex::new(None),
+        }
     }
 
     pub async fn list_sets(&self) -> Result<MasterySetsResponse> {
-        let (inventory, catalog, prices, lotus, lotus_en, lotus_frames, absorbed_keys) = {
+        let fingerprint = self.inventory_fingerprint().await?;
+        {
+            let cache = self.cache.lock().await;
+            if let Some(hit) = cache.as_ref() {
+                if hit.fingerprint == fingerprint && hit.built_at.elapsed() < MASTERY_CACHE_TTL {
+                    return Ok(hit.response.clone());
+                }
+            }
+        }
+
+        let started = Instant::now();
+        let response = self.build_sets().await?;
+        debug!(
+            sets = response.sets.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "mastery list_sets built"
+        );
+
+        *self.cache.lock().await = Some(CachedMasterySets {
+            fingerprint,
+            built_at: Instant::now(),
+            response: response.clone(),
+        });
+        Ok(response)
+    }
+
+    async fn inventory_fingerprint(&self) -> Result<u64> {
+        let db = self.db.lock().await;
+        let inv = db.list_inventory()?;
+        let mut h = DefaultHasher::new();
+        inv.len().hash(&mut h);
+        for item in &inv {
+            item.unique_name.hash(&mut h);
+            item.count.hash(&mut h);
+            item.mastered.hash(&mut h);
+            item.item_type.hash(&mut h);
+        }
+        if let Ok(Some(raw)) = db.get_setting("helminth_consumed_suits") {
+            raw.hash(&mut h);
+        }
+        if let Ok(Some(raw)) = db.get_setting("player_skills") {
+            raw.hash(&mut h);
+        }
+        Ok(h.finish())
+    }
+
+    async fn build_sets(&self) -> Result<MasterySetsResponse> {
+        // Prefer already-cached DE/WFM labels; do not block on a full re-fetch.
+        {
+            let db = self.db.lock().await;
+            let frames = db.lotus_name_count("warframe").unwrap_or(0);
+            let items = db.item_count().unwrap_or(0);
+            drop(db);
+            if frames < 40 {
+                let _ = self.pricing.ensure_lotus_mod_names().await;
+            }
+            if items < 100 {
+                let _ = self.pricing.ensure_items_cached().await;
+            }
+        }
+
+        let (inventory, catalog, prices, lotus, lotus_en, lotus_frames, absorbed_keys, player_skills) = {
             let db = self.db.lock().await;
             let inventory = db.list_inventory()?;
             let catalog = db.all_items()?;
@@ -98,7 +180,19 @@ impl MasteryService {
             // Warframe kind only — excludes exalted/ability weapons that live under /Powersuits/.
             let lotus_frames = db.lotus_name_map("warframe").unwrap_or_default();
             let absorbed_keys = absorbed_set_keys_from_db(&db);
-            (inventory, catalog, prices, lotus, lotus_en, lotus_frames, absorbed_keys)
+            let player_skills = db
+                .get_setting("player_skills")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .or_else(|| {
+                    // First run after upgrade — hydrate from disk cache.
+                    let path = dirs::data_dir()?.join("bngframe/inventory_cache.json");
+                    let text = std::fs::read_to_string(path).ok()?;
+                    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+                    body.get("PlayerSkills").cloned()
+                });
+            (inventory, catalog, prices, lotus, lotus_en, lotus_frames, absorbed_keys, player_skills)
         };
 
         let by_norm = PricingService::build_catalog_index(&catalog);
@@ -106,6 +200,7 @@ impl MasteryService {
             catalog.iter().map(|i| (i.url_name.as_str(), i)).collect();
 
         let craft_gear = self.pricing.craft_gear_map().await;
+        let craft_part_qty = self.pricing.craft_part_qty_map().await;
         let bp_product = self.pricing.weapon_blueprint_map().await;
         let lotus_by_leaf = build_lotus_leaf_index(&lotus);
 
@@ -128,6 +223,9 @@ impl MasteryService {
             }
             let set_key =
                 public_set_key_for_item(item, &lotus, &lotus_en, &bp_product).unwrap_or(raw_key);
+            // Remap modular MR carriers (amp prism / kitgun chamber / zaw tip / kdrive board).
+            let set_key = remap_modular_mastery_key(&set_key, item).unwrap_or(set_key);
+            let category = remap_modular_mastery_category(&set_key, &category);
             let entry = groups.entry(set_key.clone()).or_insert_with(|| {
                 MasterySetBuilder::new(&set_key, &category)
             });
@@ -145,6 +243,17 @@ impl MasteryService {
             }
 
             if role == "frame" || role == "weapon" {
+                if item.count > 0 {
+                    entry.owned = true;
+                }
+                if item.mastered {
+                    entry.mastered = true;
+                }
+            } else if matches!(category.as_str(), "necramech")
+                && !matches!(role.as_str(), "blueprint" | "other" | "skip")
+                && item.item_type != "blueprint"
+            {
+                // Necramech component ownership still marks the set as owned.
                 if item.count > 0 {
                     entry.owned = true;
                 }
@@ -179,6 +288,41 @@ impl MasteryService {
             }
 
             if is_component_role(&role) {
+                let resolved_url = item
+                    .url_name
+                    .as_deref()
+                    .map(crate::pricing::normalize_market_slug)
+                    .or_else(|| {
+                        // HelmetBlueprint → neuroptics_blueprint even before inventory enrich
+                        let leaf = item
+                            .unique_name
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .split('#')
+                            .next()
+                            .unwrap_or("");
+                        if leaf.is_empty() {
+                            return None;
+                        }
+                        let slug = crate::pricing::normalize_name(&crate::pricing::humanize_lotus_name(leaf))
+                            .replace(' ', "_");
+                        let slug = crate::pricing::normalize_market_slug(&slug);
+                        catalog_by_url
+                            .get(slug.as_str())
+                            .map(|r| r.url_name.clone())
+                            .or(Some(slug))
+                    });
+                let thumb = resolved_url
+                    .as_deref()
+                    .and_then(|u| catalog_by_url.get(u))
+                    .and_then(|r| r.thumb.clone())
+                    .or_else(|| {
+                        item.url_name
+                            .as_deref()
+                            .and_then(|u| catalog_by_url.get(u))
+                            .and_then(|r| r.thumb.clone())
+                    });
                 let part = entry
                     .parts
                     .entry(role.clone())
@@ -186,12 +330,21 @@ impl MasteryService {
                         role: role.clone(),
                         count: 0,
                         required: 1,
-                        url_name: item.url_name.clone(),
+                        url_name: resolved_url.clone(),
                         name: Some(item.name.clone()),
+                        thumb: thumb.clone(),
                     });
                 part.count += item.count;
                 if part.url_name.is_none() {
-                    part.url_name = item.url_name.clone();
+                    part.url_name = resolved_url;
+                } else if let Some(u) = part.url_name.as_deref() {
+                    part.url_name = Some(crate::pricing::normalize_market_slug(u));
+                }
+                if part.thumb.is_none() {
+                    part.thumb = thumb;
+                }
+                if part.name.as_deref().unwrap_or("").is_empty() {
+                    part.name = Some(item.name.clone());
                 }
             }
         }
@@ -211,15 +364,27 @@ impl MasteryService {
         // Full warframe / archwing / weapon roster + remaining WFM sets
         seed_warframes_from_lotus(&mut groups, &lotus_frames, &lotus_en);
         seed_weapons_from_lotus(&mut groups, &lotus, &lotus_en);
+        seed_companion_weapons_from_lotus(&mut groups, &lotus, &lotus_en);
         seed_market_sets_from_catalog(&mut groups, &catalog, &catalog_by_url, &prices);
+        seed_amp_kitgun_zaw_roster(&mut groups, &lotus);
+        seed_kdrives(&mut groups, &lotus);
+        seed_plexus(&mut groups, &lotus);
+        seed_intrinsics(&mut groups, player_skills.as_ref());
+
+        // Collapse inventory leaf keys (anti_prime) into public roster keys (nova_prime).
+        merge_duplicate_mastery_groups(&mut groups);
 
         let slug_ru = build_slug_ru_map(&lotus, &lotus_en, &bp_product);
+        let parts_by_set = index_catalog_parts_by_set(&catalog);
         // Final catalog resolve + Russian labels
         for entry in groups.values_mut() {
             resolve_set_catalog(entry, &by_norm, &catalog_by_url, &prices);
             apply_slug_russian_label(entry, &slug_ru);
-            finalize_set_market(entry, &catalog, &catalog_by_url, &prices);
-            fill_slots_from_catalog(entry, &catalog);
+            finalize_set_market(entry, &parts_by_set, &catalog_by_url, &prices);
+            fill_slots_from_catalog(entry, &parts_by_set);
+            apply_craft_part_quantities(entry, &craft_part_qty, &slug_ru);
+            synthesize_missing_craft_slots(entry, &slug_ru);
+            localize_part_names(entry, &slug_ru);
             apply_slug_russian_label(entry, &slug_ru);
         }
 
@@ -231,10 +396,27 @@ impl MasteryService {
                     &craft_gear,
                     &inventory,
                     &lotus,
+                    &lotus_en,
                     &by_norm,
                     &catalog_by_url,
                 );
             }
+        }
+
+        // Second merge after catalog resolve (url_name / EN names now filled).
+        merge_duplicate_mastery_groups(&mut groups);
+        for entry in groups.values_mut() {
+            apply_craft_part_quantities(entry, &craft_part_qty, &slug_ru);
+            synthesize_missing_craft_slots(entry, &slug_ru);
+            localize_part_names(entry, &slug_ru);
+            apply_slug_russian_label(entry, &slug_ru);
+        }
+
+        reclassify_mastery_categories(&mut groups);
+        for entry in groups.values_mut() {
+            synthesize_missing_craft_slots(entry, &slug_ru);
+            localize_part_names(entry, &slug_ru);
+            apply_slug_russian_label(entry, &slug_ru);
         }
 
         let mut sets: Vec<MasterySet> = groups
@@ -304,19 +486,30 @@ impl MasterySetBuilder {
                 parts.push(v.clone());
             }
         }
-        // Warframes always show the classic 4 slots
-        if category == "warframe" {
-            for role in ["blueprint", "neuroptics", "chassis", "systems"] {
-                if !parts.iter().any(|p| p.role == role) {
-                    parts.push(SetPartProgress {
-                        role: role.into(),
-                        count: 0,
-                        required: 1,
-                        url_name: None,
-                        name: None,
-                    });
-                }
-            }
+        // Keep slot order for frames / archwing suits (slots come from catalog or synthesize).
+        if category == "warframe"
+            || category == "necramech"
+            || category == "vehicle"
+            || category == "kdrive"
+            || category == "plexus"
+            || category == "intrinsic"
+            || (category == "archwing"
+                && !self.parts.keys().any(|r| {
+                    matches!(
+                        r.as_str(),
+                        "barrel"
+                            | "receiver"
+                            | "stock"
+                            | "blade"
+                            | "handle"
+                            | "head"
+                            | "link"
+                            | "grip"
+                            | "string"
+                    )
+                }))
+            || category == "companion"
+        {
             parts.sort_by_key(|p| {
                 prefer
                     .iter()
@@ -324,43 +517,10 @@ impl MasterySetBuilder {
                     .unwrap_or(99)
             });
         }
-        // Archwing suits: blueprint + harness + wings + systems
-        // (archguns/archmelee stay in this category but keep weapon part slots)
-        if category == "archwing" {
-            let has_weapon_parts = self.parts.keys().any(|r| {
-                matches!(
-                    r.as_str(),
-                    "barrel"
-                        | "receiver"
-                        | "stock"
-                        | "blade"
-                        | "handle"
-                        | "head"
-                        | "link"
-                        | "grip"
-                        | "string"
-                )
-            });
-            if !has_weapon_parts {
-                for role in ["blueprint", "harness", "wings", "systems"] {
-                    if !parts.iter().any(|p| p.role == role) {
-                        parts.push(SetPartProgress {
-                            role: role.into(),
-                            count: 0,
-                            required: 1,
-                            url_name: None,
-                            name: None,
-                        });
-                    }
-                }
-                parts.sort_by_key(|p| {
-                    prefer
-                        .iter()
-                        .position(|r| *r == p.role.as_str())
-                        .unwrap_or(99)
-                });
-            }
-        }
+
+        // One circle per required unit (Kronen 2×blade, Akbronco 2×Bronco, …).
+        let mut parts = expand_multi_qty_parts(parts);
+        scrub_duplicate_part_thumbs(self.thumb.as_deref(), &mut parts);
 
         let thumb_url = self.thumb.as_ref().map(|t| wfm_thumb_url(t));
         MasterySet {
@@ -380,6 +540,77 @@ impl MasterySetBuilder {
             url_name: self.url_name,
         }
     }
+}
+
+/// WFM often stamps the set icon hash onto every part — drop those so UI uses wiki role art.
+fn scrub_duplicate_part_thumbs(set_thumb: Option<&str>, parts: &mut [SetPartProgress]) {
+    let set_hash = set_thumb.and_then(thumb_content_hash).map(|s| s.to_string());
+    let mut hash_counts: HashMap<String, usize> = HashMap::new();
+    for p in parts.iter() {
+        if let Some(h) = p.thumb.as_deref().and_then(thumb_content_hash) {
+            *hash_counts.entry(h.to_string()).or_insert(0) += 1;
+        }
+    }
+    let shared: HashSet<String> = hash_counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .map(|(h, _)| h)
+        .collect();
+
+    for p in parts.iter_mut() {
+        let Some(h) = p.thumb.as_deref().and_then(thumb_content_hash) else {
+            continue;
+        };
+        if set_hash.as_deref() == Some(h) || shared.contains(h) {
+            p.thumb = None;
+        }
+    }
+}
+
+fn thumb_content_hash(thumb: &str) -> Option<&str> {
+    // items/images/en/thumbs/foo.<32 hex>.128x128.png
+    let bytes = thumb.as_bytes();
+    let mut i = 0;
+    while i + 34 < bytes.len() {
+        if bytes[i] == b'.' {
+            let slice = &thumb[i + 1..i + 33];
+            if slice.len() == 32 && slice.bytes().all(|b| b.is_ascii_hexdigit()) {
+                if thumb.as_bytes().get(i + 33) == Some(&b'.') {
+                    return Some(slice);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split slots with required>1 into N unit slots (required=1 each).
+fn expand_multi_qty_parts(parts: Vec<SetPartProgress>) -> Vec<SetPartProgress> {
+    let mut out = Vec::with_capacity(parts.len());
+    for p in parts {
+        let need = p.required.max(1);
+        if need <= 1 {
+            out.push(p);
+            continue;
+        }
+        for i in 0..need {
+            let role = if i == 0 {
+                p.role.clone()
+            } else {
+                format!("{}_{}", p.role, i + 1)
+            };
+            out.push(SetPartProgress {
+                role,
+                count: if p.count > i { 1 } else { 0 },
+                required: 1,
+                url_name: p.url_name.clone(),
+                name: p.name.clone(),
+                thumb: p.thumb.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Returns (set_key, role, category)
@@ -402,18 +633,22 @@ fn classify_inventory_item(
         || lower.contains("operatorarmour")
         || lower.contains("landingcraft")
         || lower.contains("abilityoverrides")
-        || lower.contains("entratimech")
         || lower.contains("geneticsignature")
         || lower.contains("geneticcode")
         || lower.contains("animaltag")
         || lower.contains("/recipes/components/")
         || lower.contains("resourcedrone")
         || lower.contains("keyblueprint")
+        || lower.contains("damaged_necramech")
+        || lower.contains("necromechpart")
+        || (lower.contains("deimosrecipes/mechs/") && lower.contains("necromech"))
         || name_l.contains("buff")
         || name_l.contains("debuff")
         || name_l.contains("quest")
         || name_l.contains("sequencer")
         || name_l.contains("resource drone")
+        || name_l.contains("катализатор заражения")
+        || name_l.contains("поврежденн") && name_l.contains("некрамех")
         || (name_l.contains("drone") && !lower.contains("powersuit") && !lower.contains("sentinel"))
         || name_l.contains("alloy")
         || name_l.contains("cipher")
@@ -443,12 +678,62 @@ fn classify_inventory_item(
 
     // Owned / crafted gear — track owned + mastered on the set card
     if let Some((key, cat)) = owned_gear_mastery_cat(item) {
-        let role = if cat == "warframe" || cat == "archwing" || cat == "companion" {
+        let role = if matches!(
+            cat.as_str(),
+            "warframe" | "archwing" | "companion" | "necramech" | "kdrive" | "plexus"
+        ) {
             "frame"
         } else {
             "weapon"
         };
         return (key, role.into(), cat);
+    }
+
+    // Sentinel / robotic / hound weapons (often typed misc before reclassify)
+    if is_sentinel_weapon_path(&lower) || is_robotic_weapon_path(&lower) {
+        let role = "weapon".into();
+        let key = leaf_set_key(unique);
+        let cat = infer_weapon_slot_category(&lower, &name_l);
+        return (key, role, cat.into());
+    }
+
+    // Amp prism / kitgun chamber / zaw tip / k-drive board / plexus
+    if is_mr_amp_path(&lower)
+        || is_mr_kitgun_chamber_path(&lower)
+        || is_mr_zaw_strike_path(&lower)
+        || (lower.contains("hoverboard") && lower.contains("deck"))
+        || lower.contains("defaultharness")
+        || lower.contains("drifterpistol")
+    {
+        let key = remap_modular_mastery_key(&leaf_set_key(unique), item)
+            .unwrap_or_else(|| leaf_set_key(unique));
+        if is_non_mr_modular_part(&key, &name_l) {
+            return (String::new(), "skip".into(), String::new());
+        }
+        let cat = remap_modular_mastery_category(&key, "modular");
+        return (key, "weapon".into(), cat);
+    }
+
+    // Necramech (EntratiMech) component recipes
+    if lower.contains("entratimech")
+        || (lower.contains("deimosrecipes")
+            && lower.contains("/mechs/")
+            && !lower.contains("necromech"))
+    {
+        let role = role_from_slug(&url_l)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| part_role_from(&lower, &name_l));
+        let role = if role == "other" {
+            "blueprint".into()
+        } else {
+            role
+        };
+        let leaf = unique.rsplit('/').next().unwrap_or(unique);
+        let key = camel_to_set_key(warframe_public_leaf(leaf));
+        if key.is_empty() || key.contains("necromech") {
+            return (String::new(), "skip".into(), String::new());
+        }
+        return (key, role, "necramech".into());
     }
 
     // Warframe component blueprints / crafted parts
@@ -505,7 +790,8 @@ fn classify_inventory_item(
         if role == "other" {
             return (String::new(), "skip".into(), String::new());
         }
-        let key = leaf_set_key(unique);
+        let leaf = unique.rsplit('/').next().unwrap_or(unique);
+        let key = camel_to_set_key(warframe_public_leaf(leaf));
         return (key, role, "warframe".into());
     }
 
@@ -535,12 +821,13 @@ fn classify_inventory_item(
         // CompleteHeadB blueprints share the HeadB part set
         let key = if leaf.contains("ZanukaPetCompleteHead") {
             if let Some(alias) = alias_lotus_product_unique(unique) {
-                leaf_set_key(&alias)
+                companion_recipe_set_key(alias.rsplit('/').next().unwrap_or(&alias))
+                    .unwrap_or_else(|| leaf_set_key(&alias))
             } else {
-                leaf_set_key(unique)
+                companion_recipe_set_key(leaf).unwrap_or_else(|| leaf_set_key(unique))
             }
         } else {
-            leaf_set_key(unique)
+            companion_recipe_set_key(leaf).unwrap_or_else(|| leaf_set_key(unique))
         };
         return (key, role, "companion".into());
     }
@@ -624,7 +911,6 @@ fn owned_gear_mastery_cat(item: &InventoryItem) -> Option<(String, String)> {
         || lower.contains("emote")
         || lower.contains("augment")
         || (lower.contains("helmet") && !lower.contains("warframerecipes"))
-        || lower.contains("entratimech")
         || lower.contains("/recipes/")
         || lower.contains("blueprint")
     {
@@ -643,11 +929,23 @@ fn owned_gear_mastery_cat(item: &InventoryItem) -> Option<(String, String)> {
         _ if is_companion_path(&lower) && (lower.contains("powersuit") || lower.contains("kavat")) => {
             "companion"
         }
+        _ if lower.contains("entratimech") => "necramech",
+        _ if lower.contains("hoverboard") && lower.contains("deck") => "kdrive",
+        _ if lower.contains("defaultharness") => "plexus",
+        _ if is_mr_amp_path(&lower) || is_mr_kitgun_chamber_path(&lower) => "modular",
+        _ if is_mr_zaw_strike_path(&lower) => "melee",
         "warframe" if lower.contains("/archwing/") => "archwing",
+        "warframe" if lower.contains("entratimech") => "necramech",
         "warframe" => "warframe",
         "primary" => "primary",
         "secondary" => "secondary",
         "melee" => "melee",
+        "modular" => "modular",
+        "kdrive" => "kdrive",
+        "plexus" => "plexus",
+        "sentinel" if is_sentinel_weapon_path(&lower) || is_robotic_weapon_path(&lower) => {
+            infer_weapon_slot_category(&lower, &item.name.to_lowercase())
+        }
         "sentinel" => "companion",
         "archwing" => "archwing",
         "weapon" if lower.contains("/archwing/") => "archwing",
@@ -659,12 +957,23 @@ fn owned_gear_mastery_cat(item: &InventoryItem) -> Option<(String, String)> {
 
     // Only companion/modular misc paths, not every misc row
     if item.item_type == "misc"
-        && !matches!(cat, "companion" | "modular" | "archwing")
+        && !matches!(
+            cat,
+            "companion" | "modular" | "archwing" | "necramech" | "kdrive" | "plexus"
+        )
     {
         return None;
     }
 
     let key = gear_set_key(unique, &lower, cat);
+    let key = if cat == "necramech" {
+        let leaf = unique.rsplit('/').next().unwrap_or(unique);
+        camel_to_set_key(warframe_public_leaf(leaf))
+    } else if let Some(mapped) = remap_modular_mastery_key(&leaf_set_key(unique), item) {
+        mapped
+    } else {
+        key
+    };
     if key.is_empty() {
         return None;
     }
@@ -700,6 +1009,9 @@ fn gear_set_key(unique: &str, lower: &str, cat: &str) -> String {
         return camel_to_set_key(public);
     }
     if cat == "companion" {
+        if let Some(key) = companion_recipe_set_key(leaf) {
+            return key;
+        }
         if let Some(public) = companion_public_leaf(leaf) {
             return camel_to_set_key(public);
         }
@@ -709,36 +1021,83 @@ fn gear_set_key(unique: &str, lower: &str, cat: &str) -> String {
 
 fn companion_public_leaf(leaf: &str) -> Option<&'static str> {
     match leaf {
-        "ArcDronePowerSuit" => Some("Diriga"),
-        "GubberPowerSuit" => Some("Djinn"),
-        "MeleePetPowerSuit" => Some("Helios"),
-        "PrimeHeliosPowerSuit" => Some("HeliosPrime"),
-        "RadarPowerSuit" => Some("Oxylus"),
-        "TnSentinelCrossPowerSuit" => Some("Taxon"),
-        "EmpyreanSentinelPowerSuit" => Some("Nautilus"),
-        "NautilusPrimeSentinelPowerSuit" => Some("NautilusPrime"),
-        "CheshireCatbrowPetPowerSuit" => Some("SmeetaKavat"),
-        "MirrorCatbrowPetPowerSuit" => Some("AdarzaKavat"),
-        "VampireCatbrowPetPowerSuit" => Some("VascaKavat"),
-        "RetrieverKubrowPetPowerSuit" => Some("ChesaKubrow"),
-        "FurtiveKubrowPetPowerSuit" => Some("HurasKubrow"),
-        "GuardKubrowPetPowerSuit" => Some("RaksaKubrow"),
-        "AdventurerKubrowPetPowerSuit" => Some("SahasaKubrow"),
-        "HunterKubrowPetPowerSuit" => Some("SunikaKubrow"),
-        "ChargerKubrowPetPowerSuit" => Some("HelminthCharger"),
-        "ArmoredInfestedCatbrowPetPowerSuit" => Some("PanzerVulpaphyla"),
-        "HornedInfestedCatbrowPetPowerSuit" => Some("CrescentVulpaphyla"),
-        "VulpineInfestedCatbrowPetPowerSuit" => Some("SlyVulpaphyla"),
-        "MedjayPredatorKubrowPetPowerSuit" => Some("MedjayPredasite"),
-        "PharaohPredatorKubrowPetPowerSuit" => Some("PharaohPredasite"),
-        "VizierPredatorKubrowPetPowerSuit" => Some("VizierPredasite"),
-        "KhoraKavatPowerSuit" => Some("Venari"),
-        "KhoraPrimeKavatPowerSuit" => Some("VenariPrime"),
-        "ZanukaPetAPowerSuit" => Some("Dorma"),
-        "ZanukaPetBPowerSuit" => Some("Bhaira"),
-        "ZanukaPetCPowerSuit" => Some("Hec"),
+        "ArcDronePowerSuit" | "ArcDrone" => Some("Diriga"),
+        "GubberPowerSuit" | "Gubber" => Some("Djinn"),
+        "MeleePetPowerSuit" | "MeleePet" => Some("Helios"),
+        "PrimeHeliosPowerSuit" | "PrimeHelios" | "HeliosPrime" => Some("HeliosPrime"),
+        "RadarPowerSuit" | "Radar" => Some("Oxylus"),
+        "TnSentinelCrossPowerSuit" | "TnSentinelCross" => Some("Taxon"),
+        "EmpyreanSentinelPowerSuit" | "EmpyreanSentinel" => Some("Nautilus"),
+        "NautilusPrimeSentinelPowerSuit" | "NautilusPrimeSentinel" | "NautilusPrime" => {
+            Some("NautilusPrime")
+        }
+        "CheshireCatbrowPetPowerSuit" | "CheshireCatbrowPet" => Some("SmeetaKavat"),
+        "MirrorCatbrowPetPowerSuit" | "MirrorCatbrowPet" => Some("AdarzaKavat"),
+        "VampireCatbrowPetPowerSuit" | "VampireCatbrowPet" => Some("VascaKavat"),
+        "RetrieverKubrowPetPowerSuit" | "RetrieverKubrowPet" => Some("ChesaKubrow"),
+        "FurtiveKubrowPetPowerSuit" | "FurtiveKubrowPet" => Some("HurasKubrow"),
+        "GuardKubrowPetPowerSuit" | "GuardKubrowPet" => Some("RaksaKubrow"),
+        "AdventurerKubrowPetPowerSuit" | "AdventurerKubrowPet" => Some("SahasaKubrow"),
+        "HunterKubrowPetPowerSuit" | "HunterKubrowPet" => Some("SunikaKubrow"),
+        "ChargerKubrowPetPowerSuit" | "ChargerKubrowPet" => Some("HelminthCharger"),
+        "ArmoredInfestedCatbrowPetPowerSuit" | "ArmoredInfestedCatbrowPet" => {
+            Some("PanzerVulpaphyla")
+        }
+        "HornedInfestedCatbrowPetPowerSuit" | "HornedInfestedCatbrowPet" => {
+            Some("CrescentVulpaphyla")
+        }
+        "VulpineInfestedCatbrowPetPowerSuit" | "VulpineInfestedCatbrowPet" => {
+            Some("SlyVulpaphyla")
+        }
+        "MedjayPredatorKubrowPetPowerSuit" | "MedjayPredatorKubrowPet" => Some("MedjayPredasite"),
+        "PharaohPredatorKubrowPetPowerSuit" | "PharaohPredatorKubrowPet" => {
+            Some("PharaohPredasite")
+        }
+        "VizierPredatorKubrowPetPowerSuit" | "VizierPredatorKubrowPet" => Some("VizierPredasite"),
+        "KhoraKavatPowerSuit" | "KhoraKavat" => Some("Venari"),
+        "KhoraPrimeKavatPowerSuit" | "KhoraPrimeKavat" => Some("VenariPrime"),
+        "ZanukaPetAPowerSuit" | "ZanukaPetA" => Some("Dorma"),
+        "ZanukaPetBPowerSuit" | "ZanukaPetB" => Some("Bhaira"),
+        "ZanukaPetCPowerSuit" | "ZanukaPetC" => Some("Hec"),
+        "DethCubePowerSuit" | "DethCube" | "Dethcube" => Some("Dethcube"),
+        "PrimeDethCubePowerSuit" | "PrimeDethCube" | "DethcubePrime" => Some("DethcubePrime"),
+        "CarrierPowerSuit" | "Carrier" => Some("Carrier"),
+        "PrimeCarrierPowerSuit" | "PrimeCarrier" | "CarrierPrime" => Some("CarrierPrime"),
+        "ShadePowerSuit" | "Shade" => Some("Shade"),
+        "PrimeShadePowerSuit" | "PrimeShade" | "ShadePrime" => Some("ShadePrime"),
+        "WyrmPowerSuit" | "Wyrm" => Some("Wyrm"),
+        "PrimeWyrmPowerSuit" | "PrimeWyrm" | "WyrmPrime" => Some("WyrmPrime"),
         _ => None,
     }
+}
+
+/// Recipe / part leaf → public companion set_key (Diriga, not arc_drone).
+fn companion_recipe_set_key(leaf: &str) -> Option<String> {
+    let mut base = leaf.to_string();
+    for suf in [
+        "Blueprint",
+        "Carapace",
+        "Cerebrum",
+        "Systems",
+        "Helmet",
+        "Component",
+        "Harness",
+        "Wings",
+    ] {
+        if let Some(stripped) = base.strip_suffix(suf) {
+            if !stripped.is_empty() {
+                base = stripped.to_string();
+            }
+        }
+    }
+    if let Some(public) = companion_public_leaf(&base) {
+        return Some(camel_to_set_key(public));
+    }
+    let with_ps = format!("{base}PowerSuit");
+    if let Some(public) = companion_public_leaf(&with_ps) {
+        return Some(camel_to_set_key(public));
+    }
+    None
 }
 
 /// Prefer public market/wiki slug (Acceltra → acceltra) over internal Lotus leaves.
@@ -766,6 +1125,9 @@ fn public_set_key_for_item(
     if lower.contains("/powersuits/") || lower.contains("warframerecipes") {
         // Venari etc.
         if is_companion_path(&lower) {
+            if let Some(key) = companion_recipe_set_key(leaf) {
+                return Some(key);
+            }
             if let Some(public) = companion_public_leaf(leaf) {
                 let key = camel_to_set_key(public);
                 return (!key.is_empty()).then_some(key);
@@ -775,9 +1137,20 @@ fn public_set_key_for_item(
         return (!key.is_empty()).then_some(key);
     }
     if is_companion_path(&lower) {
+        if let Some(key) = companion_recipe_set_key(leaf) {
+            return Some(key);
+        }
         if let Some(public) = companion_public_leaf(leaf) {
             let key = camel_to_set_key(public);
             return (!key.is_empty()).then_some(key);
+        }
+    }
+
+    // Warframe component leaves outside WarframeRecipes (inventory name-based path)
+    if leaf_looks_warframe_component(leaf) {
+        let key = camel_to_set_key(warframe_public_leaf(leaf));
+        if !key.is_empty() {
+            return Some(key);
         }
     }
 
@@ -811,6 +1184,19 @@ fn public_set_key_for_item(
     None
 }
 
+fn leaf_looks_warframe_component(leaf: &str) -> bool {
+    leaf.contains("Neuroptics")
+        || leaf.contains("Chassis")
+        || leaf.contains("Systems")
+        || leaf.ends_with("Helmet")
+        || leaf.ends_with("HelmetBlueprint")
+        || (leaf.contains("Prime")
+            && (leaf.ends_with("Blueprint")
+                || leaf.contains("Neuro")
+                || leaf.contains("Chassis")
+                || leaf.contains("Systems")))
+}
+
 fn en_label_to_set_key(en: Option<&str>) -> Option<String> {
     let cleaned = strip_export_tags(en?);
     if cleaned.is_empty() || looks_russian(&cleaned) {
@@ -840,6 +1226,7 @@ fn strip_weapon_part_label(name: &str) -> String {
         " Gauntlet",
         " Pouch",
         " Chain",
+        " Ornament",
         " Hilt",
         " Guard",
         " Head",
@@ -889,6 +1276,7 @@ fn parent_weapon_public_set_key(
         "Gauntlet",
         "Pouch",
         "Chain",
+        "Ornament",
         "Hilt",
         "Guard",
         "Head",
@@ -937,13 +1325,43 @@ fn parent_weapon_public_set_key(
 }
 
 fn apply_lotus_display_name(entry: &mut MasterySetBuilder, raw: &str, prefer: bool) {
-    let cleaned = strip_export_tags(raw);
+    let cleaned = strip_part_suffix_name(&strip_export_tags(raw));
     if cleaned.is_empty() {
         return;
     }
-    // Part labels ("Арбуцеп: Ствол") must not rename the whole set card.
-    if cleaned.contains(':') && !prefer {
-        return;
+    // Reject "Сет: Нейрооптика" but keep companion breeds ("Гончая: Бхайра").
+    if let Some((_, after)) = cleaned.split_once(':') {
+        let after = after.trim().to_lowercase();
+        if matches!(
+            after.as_str(),
+            "нейрооптика"
+                | "каркас"
+                | "система"
+                | "панцирь"
+                | "мозг"
+                | "упряжь"
+                | "крылья"
+                | "ствол"
+                | "приёмник"
+                | "приемник"
+                | "приклад"
+                | "связь"
+                | "клинок"
+                | "рукоять"
+                | "чертеж"
+                | "neuroptics"
+                | "chassis"
+                | "systems"
+                | "blueprint"
+                | "carapace"
+                | "cerebrum"
+                | "barrel"
+                | "receiver"
+        ) || after.contains("чертеж")
+            || after.contains("blueprint")
+        {
+            return;
+        }
     }
     if looks_russian(&cleaned) {
         if prefer || entry.name_ru.as_ref().is_none_or(|r| !looks_russian(r)) {
@@ -1053,6 +1471,10 @@ fn mastery_category_from_paths(lower: &str, name_l: &str, item_type: &str) -> Op
     if is_modular_path(lower) {
         return Some("modular");
     }
+    // SentinelWeapons (Artax, …) grant MR as weapons — not companion craft sets.
+    if is_sentinel_weapon_path(lower) {
+        return Some(infer_weapon_slot_category(lower, name_l));
+    }
     if is_companion_path(lower) || item_type == "sentinel" {
         return Some("companion");
     }
@@ -1071,7 +1493,16 @@ fn mastery_category_from_paths(lower: &str, name_l: &str, item_type: &str) -> Op
     Some(infer_weapon_slot_category(lower, name_l))
 }
 
+fn is_sentinel_weapon_path(lower: &str) -> bool {
+    lower.contains("sentinelweapon")
+        || lower.contains("/sentinels/weapons/")
+        || lower.contains("/types/sentinels/sentinelweapons/")
+}
+
 fn is_companion_path(lower: &str) -> bool {
+    if is_sentinel_weapon_path(lower) {
+        return false;
+    }
     lower.contains("sentinel")
         || lower.contains("kubrow")
         || lower.contains("kavat")
@@ -1189,7 +1620,17 @@ fn infer_weapon_slot_category(lower: &str, name_l: &str) -> &'static str {
 fn is_mastery_type_category(cat: &str) -> bool {
     matches!(
         cat,
-        "warframe" | "primary" | "secondary" | "melee" | "companion" | "archwing" | "modular"
+        "warframe"
+            | "primary"
+            | "secondary"
+            | "melee"
+            | "companion"
+            | "archwing"
+            | "modular"
+            | "necramech"
+            | "kdrive"
+            | "plexus"
+            | "intrinsic"
     )
 }
 
@@ -1200,10 +1641,65 @@ fn should_upgrade_mastery_category(current: &str, next: &str) -> bool {
     if !is_mastery_type_category(next) {
         return false;
     }
+    // Necramechs are often seeded as warframes (EntratiMech powersuits).
+    if next == "necramech" && matches!(current, "warframe" | "primary" | "prime" | "") {
+        return true;
+    }
+    if next == "modular" && matches!(current, "primary" | "secondary" | "melee" | "") {
+        return true;
+    }
+    if next == "kdrive" || next == "plexus" || next == "intrinsic" {
+        return true;
+    }
     matches!(
         current,
         "prime" | "weapon_prime" | "weapon" | "primary" | ""
     ) || !is_mastery_type_category(current)
+}
+
+fn is_necramech_set_key(key: &str) -> bool {
+    matches!(
+        key,
+        "voidrig" | "bonewidow" | "bonewidow_prime" | "nechro_tech" | "thano_tech"
+    )
+}
+
+fn is_landing_craft_set_key(key: &str) -> bool {
+    matches!(
+        key,
+        "liset" | "mantis" | "scimitar" | "xiphos" | "parallax"
+    )
+}
+
+/// Force correct categories after all seed/merge passes.
+fn reclassify_mastery_categories(groups: &mut HashMap<String, MasterySetBuilder>) {
+    for entry in groups.values_mut() {
+        if is_necramech_set_key(&entry.set_key)
+            || entry.display_name.to_lowercase().contains("voidrig")
+            || entry.display_name.to_lowercase().contains("bonewidow")
+            || entry
+                .name_ru
+                .as_deref()
+                .is_some_and(|n| {
+                    let n = n.to_lowercase();
+                    n.contains("войдриг") || n.contains("костяная вдова")
+                })
+        {
+            entry.category = "necramech".into();
+            continue;
+        }
+        if entry.set_key == "sirocco" {
+            entry.category = "modular".into();
+            continue;
+        }
+        if is_kdrive_set_key(&entry.set_key) {
+            entry.category = "kdrive".into();
+            continue;
+        }
+        if entry.set_key == "plexus" {
+            entry.category = "plexus".into();
+        }
+    }
 }
 
 
@@ -1290,7 +1786,7 @@ fn apply_catalog_row(
 /// Prefer full-set WFM price (`*_set`); fall back to sum of all set parts.
 fn finalize_set_market(
     entry: &mut MasterySetBuilder,
-    catalog: &[ItemRow],
+    parts_by_set: &HashMap<String, Vec<&ItemRow>>,
     catalog_by_url: &HashMap<&str, &ItemRow>,
     prices: &HashMap<String, f64>,
 ) {
@@ -1331,21 +1827,12 @@ fn finalize_set_market(
     // Sum every part that belongs to this set (exclude the set row itself)
     let mut sum = 0.0_f64;
     let mut n = 0usize;
-    for row in catalog {
-        if row.url_name == set_slug || row.url_name.ends_with("_set") {
-            continue;
-        }
-        let parent = row
-            .set_url_name
-            .as_deref()
-            .and_then(canonicalize_set_slug)
-            .or_else(|| canonicalize_set_slug(&row.url_name));
-        if parent.as_deref() != Some(set_slug.as_str()) {
-            continue;
-        }
-        if let Some(p) = prices.get(&row.url_name) {
-            sum += *p;
-            n += 1;
+    if let Some(rows) = parts_by_set.get(&set_slug) {
+        for row in rows {
+            if let Some(p) = prices.get(&row.url_name) {
+                sum += *p;
+                n += 1;
+            }
         }
     }
     entry.platinum = if n > 0 { Some(sum) } else { None };
@@ -1450,6 +1937,14 @@ fn borrow_market_label_and_thumb(
 fn keep_mastery_set(s: &MasterySet) -> bool {
     let name_l = s.name.to_lowercase();
     let key_l = s.set_key.to_lowercase();
+    // Landing crafts do not grant Mastery Rank (wiki Mastery Rank / checklist).
+    if s.category == "vehicle" || is_landing_craft_set_key(&key_l) {
+        return false;
+    }
+    // Non-MR modular components (grips, chassis, loaders, zaw handles, k-drive jets).
+    if is_non_mr_modular_part(&key_l, &name_l) {
+        return false;
+    }
     if name_l.contains("helmet")
         || name_l.contains("augment")
         || name_l.contains("charm")
@@ -1461,6 +1956,7 @@ fn keep_mastery_set(s: &MasterySet) -> bool {
         || (name_l.contains("drone")
             && !name_l.contains("diriga")
             && !key_l.contains("arc_drone")
+            && !key_l.contains("diriga")
             && !key_l.contains("powersuit"))
         || name_l.contains("antigen")
         || name_l.contains("event ingredient")
@@ -1486,6 +1982,7 @@ fn keep_mastery_set(s: &MasterySet) -> bool {
         || key_l.contains("quest")
         || (key_l.contains("drone")
             && !key_l.contains("arc_drone")
+            && !key_l.contains("diriga")
             && !key_l.contains("powersuit"))
         || key_l.ends_with("_key")
         || key_l.contains("_key_")
@@ -1493,7 +1990,10 @@ fn keep_mastery_set(s: &MasterySet) -> bool {
         || key_l.contains("cipher")
         || key_l.contains("antigen")
         || key_l.contains("event_ingredient")
-        || key_l.contains("eventium")
+        || key_l.contains("event_clan")
+        || key_l.contains("infested_event")
+        || key_l.contains("clan_ingredient")
+        || key_l.contains("damaged_necramech")
         || key_l.contains("negator")
         || key_l.contains("specter_summon")
         || key_l.contains("kubrow_egg")
@@ -1503,11 +2003,14 @@ fn keep_mastery_set(s: &MasterySet) -> bool {
         || key_l.contains("egg_hatcher")
         || key_l.contains("generic_lens")
         || key_l.contains("team_energy")
-        || key_l.contains("hoverboard")
+        || (key_l.contains("hoverboard") && !is_kdrive_set_key(&key_l))
         || key_l.contains("hacking_device")
         || key_l.contains("necromech_part")
         || name_l.contains("alloy")
         || name_l.contains("cipher")
+        || name_l.contains("катализатор заражения")
+        || name_l.contains("эйдолонский филаксис")
+        || name_l.contains("поврежденн") && name_l.contains("некрамех")
         || (name_l.contains("gem") && name_l.contains("cut"))
         || name_l.contains(" ore")
     {
@@ -1517,6 +2020,63 @@ fn keep_mastery_set(s: &MasterySet) -> bool {
     if key_l.starts_with("zanuka_pet_part")
         || key_l.contains("zanuka_pet_complete")
         || key_l.starts_with("zanuka_pet_") && key_l.contains("power_suit")
+    {
+        return false;
+    }
+    // Junk / non-set fragments mistaken for mastery cards
+    if key_l.contains("air_support")
+        || key_l.contains("kubrow_collar")
+        || key_l.ends_with("_collar")
+        || key_l.ends_with("_boot")
+        || key_l.ends_with("_stars")
+        || key_l.ends_with("_right")
+        || key_l.ends_with("_left")
+        || key_l.ends_with("_disc")
+        || name_l.contains("air support")
+        || name_l.contains("ошейник")
+        || name_l.contains("ступня")
+        || name_l.contains("сюрикен")
+    {
+        return false;
+    }
+    // Lone companion/weapon part cards (мозг / панцирь / перчатка) without a full set
+    let part_roles_only = s.parts.len() == 1
+        && s.parts.iter().any(|p| {
+            matches!(
+                p.role.as_str(),
+                "cerebrum"
+                    | "carapace"
+                    | "neuroptics"
+                    | "chassis"
+                    | "barrel"
+                    | "receiver"
+                    | "stock"
+                    | "blade"
+                    | "handle"
+                    | "link"
+                    | "gauntlet"
+                    | "boot"
+                    | "stars"
+            )
+        });
+    if part_roles_only
+        && !s.owned
+        && !s.mastered
+        && s.parts.iter().all(|p| p.count == 0)
+    {
+        return false;
+    }
+    // Titles that are clearly a single part label
+    if (name_l.contains(": мозг")
+        || name_l.contains(": панцир")
+        || name_l.contains(": нейро")
+        || name_l.contains(": каркас")
+        || name_l.contains(": ствол")
+        || name_l.contains(": приёмник")
+        || name_l.contains(": приемник")
+        || name_l.contains(" cerebrum")
+        || name_l.contains(" carapace"))
+        && s.category != "modular"
     {
         return false;
     }
@@ -1572,14 +2132,28 @@ fn keep_mastery_set(s: &MasterySet) -> bool {
     if s.url_name
         .as_deref()
         .is_some_and(|u| u.ends_with("_set"))
-        && !s.parts.is_empty()
+        && (!s.parts.is_empty()
+            || matches!(cat, "necramech" | "kdrive" | "plexus" | "intrinsic" | "modular")
+            || is_necramech_set_key(&key_l)
+            || is_kdrive_set_key(&key_l)
+            || is_amp_kitgun_zaw_key(&key_l))
     {
         return true;
     }
     // Roster-seeded frames / weapons / companions (may have empty or zero-count slots)
     matches!(
         cat,
-        "warframe" | "companion" | "primary" | "secondary" | "melee" | "archwing" | "modular"
+        "warframe"
+            | "companion"
+            | "primary"
+            | "secondary"
+            | "melee"
+            | "archwing"
+            | "modular"
+            | "necramech"
+            | "kdrive"
+            | "plexus"
+            | "intrinsic"
     )
 }
 
@@ -1630,13 +2204,26 @@ fn build_slug_ru_map(
             }
         }
         let lower = unique.to_lowercase();
-        if lower.contains("/powersuits/") || lower.contains("warframerecipes") {
-            let public = if lower.contains("/archwing/") {
-                archwing_public_leaf(leaf)
-            } else {
-                warframe_public_leaf(leaf)
-            };
-            insert_slug(&mut out, camel_to_set_key(public), cleaned.clone());
+        if lower.contains("/archwing/")
+            && (lower.contains("/powersuits/") || lower.contains("archwingrecipes"))
+        {
+            insert_slug(
+                &mut out,
+                camel_to_set_key(archwing_public_leaf(leaf)),
+                cleaned.clone(),
+            );
+        } else if is_companion_path(&lower) {
+            if let Some(ck) = companion_recipe_set_key(leaf)
+                .or_else(|| companion_public_leaf(leaf).map(camel_to_set_key))
+            {
+                insert_slug(&mut out, ck, cleaned.clone());
+            }
+        } else if lower.contains("/powersuits/") || lower.contains("warframerecipes") {
+            insert_slug(
+                &mut out,
+                camel_to_set_key(warframe_public_leaf(leaf)),
+                cleaned.clone(),
+            );
         }
     }
 
@@ -1684,6 +2271,12 @@ fn apply_slug_russian_label(entry: &mut MasterySetBuilder, slug_ru: &HashMap<Str
     if !from_display.is_empty() {
         candidates.push(from_display);
     }
+    if let Some(url) = entry.url_name.as_deref() {
+        let base = url.strip_suffix("_set").unwrap_or(url);
+        if !base.is_empty() {
+            candidates.push(base.to_string());
+        }
+    }
     for c in candidates {
         if let Some(ru) = slug_ru.get(&c) {
             entry.name_ru = Some(ru.clone());
@@ -1699,6 +2292,250 @@ fn apply_slug_russian_label(entry: &mut MasterySetBuilder, slug_ru: &HashMap<Str
                 entry.display_name = labeled;
                 return;
             }
+        }
+    }
+}
+
+/// Merge cards that share a WFM set slug or the same English display name.
+fn merge_duplicate_mastery_groups(groups: &mut HashMap<String, MasterySetBuilder>) {
+    if groups.len() < 2 {
+        return;
+    }
+
+    let mut cluster_of: HashMap<String, String> = HashMap::new();
+
+    let union = |cluster_of: &mut HashMap<String, String>, a: &str, b: &str| {
+        let ra = {
+            let mut cur = a.to_string();
+            while let Some(p) = cluster_of.get(&cur).cloned() {
+                if p == cur {
+                    break;
+                }
+                cur = p;
+            }
+            cur
+        };
+        let rb = {
+            let mut cur = b.to_string();
+            while let Some(p) = cluster_of.get(&cur).cloned() {
+                if p == cur {
+                    break;
+                }
+                cur = p;
+            }
+            cur
+        };
+        if ra == rb {
+            return;
+        }
+        let keep = choose_better_set_key(&ra, &rb, groups);
+        let drop = if keep == ra { rb } else { ra };
+        cluster_of.insert(drop, keep.clone());
+        cluster_of.insert(keep.clone(), keep);
+    };
+
+    // Seed each key as its own cluster root
+    for key in groups.keys() {
+        cluster_of.insert(key.clone(), key.clone());
+    }
+
+    // By WFM set base (nova_prime_set → nova_prime)
+    let mut by_market: HashMap<String, String> = HashMap::new();
+    for (key, entry) in groups.iter() {
+        let Some(url) = entry.url_name.as_deref() else {
+            continue;
+        };
+        let base = url.strip_suffix("_set").unwrap_or(url);
+        if base.is_empty() {
+            continue;
+        }
+        if let Some(existing) = by_market.get(base) {
+            union(&mut cluster_of, existing, key);
+        } else {
+            by_market.insert(base.to_string(), key.clone());
+        }
+        // Leaf key that equals market base joins that cluster
+        if groups.contains_key(base) {
+            union(&mut cluster_of, base, key);
+        }
+    }
+
+    // By normalized English display name ("Nova Prime")
+    let mut by_en: HashMap<String, String> = HashMap::new();
+    for (key, entry) in groups.iter() {
+        let label = if looks_russian(&entry.display_name) {
+            humanize_set_key(key)
+        } else {
+            entry.display_name.clone()
+        };
+        let norm = normalize_name(&strip_part_suffix_name(&label));
+        if norm.len() < 3 {
+            continue;
+        }
+        if let Some(existing) = by_en.get(&norm) {
+            union(&mut cluster_of, existing, key);
+        } else {
+            by_en.insert(norm, key.clone());
+        }
+    }
+
+    // By Russian title (Воруна / Нова Прайм) — catches Lotus alias duplicates
+    let mut by_ru: HashMap<String, String> = HashMap::new();
+    for (key, entry) in groups.iter() {
+        let label = entry
+            .name_ru
+            .as_deref()
+            .filter(|s| looks_russian(s))
+            .or_else(|| {
+                looks_russian(&entry.display_name).then_some(entry.display_name.as_str())
+            });
+        let Some(label) = label else {
+            continue;
+        };
+        let norm = strip_part_suffix_name(label)
+            .chars()
+            .flat_map(|c| c.to_lowercase())
+            .collect::<String>();
+        let norm = norm.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm.chars().count() < 2 {
+            continue;
+        }
+        if let Some(existing) = by_ru.get(&norm) {
+            union(&mut cluster_of, existing, key);
+        } else {
+            by_ru.insert(norm, key.clone());
+        }
+    }
+
+    // Resolve final roots and merge donors into keepers
+    let keys: Vec<String> = groups.keys().cloned().collect();
+    let mut remaps: Vec<(String, String)> = Vec::new();
+    for key in &keys {
+        let mut root = key.clone();
+        while let Some(p) = cluster_of.get(&root).cloned() {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        // Prefer market-matching root when available
+        if let Some(entry) = groups.get(key) {
+            if let Some(url) = entry.url_name.as_deref() {
+                let base = url.strip_suffix("_set").unwrap_or(url);
+                if groups.contains_key(base) {
+                    root = choose_better_set_key(&root, base, groups);
+                }
+            }
+        }
+        if root != *key {
+            remaps.push((key.clone(), root));
+        }
+    }
+
+    for (from, to) in remaps {
+        if from == to || !groups.contains_key(&from) || !groups.contains_key(&to) {
+            continue;
+        }
+        let donor = groups.remove(&from).unwrap();
+        if let Some(dest) = groups.get_mut(&to) {
+            merge_builder_into(dest, donor);
+        }
+    }
+}
+
+fn choose_better_set_key(
+    a: &str,
+    b: &str,
+    groups: &HashMap<String, MasterySetBuilder>,
+) -> String {
+    let score = |k: &str| -> i32 {
+        let Some(e) = groups.get(k) else {
+            return 0;
+        };
+        let mut s = 0i32;
+        if e.owned {
+            s += 10;
+        }
+        if e.mastered {
+            s += 5;
+        }
+        if e.absorbed {
+            s += 3;
+        }
+        s += e.parts.len() as i32;
+        if e.name_ru.as_ref().is_some_and(|r| looks_russian(r)) {
+            s += 2;
+        }
+        if let Some(url) = e.url_name.as_deref() {
+            let base = url.strip_suffix("_set").unwrap_or(url);
+            if base == k {
+                s += 40;
+            }
+        }
+        // Prefer public roster keys over internal Lotus leaves
+        if k.starts_with("prime_")
+            || k.ends_with("_frame")
+            || k.ends_with("_tech")
+            || k.ends_with("_sentinel")
+            || k.ends_with("_gun")
+            || k.ends_with("_shotgun")
+        {
+            s -= 20;
+        }
+        s
+    };
+    if score(b) > score(a) {
+        b.to_string()
+    } else {
+        a.to_string()
+    }
+}
+
+fn merge_builder_into(dest: &mut MasterySetBuilder, donor: MasterySetBuilder) {
+    dest.owned |= donor.owned;
+    dest.mastered |= donor.mastered;
+    dest.absorbed |= donor.absorbed;
+    dest.vaulted |= donor.vaulted;
+    if dest.thumb.is_none() {
+        dest.thumb = donor.thumb;
+    }
+    if dest.url_name.is_none() {
+        dest.url_name = donor.url_name;
+    }
+    if dest.platinum.is_none() {
+        dest.platinum = donor.platinum;
+    }
+    if dest.ducats.is_none() {
+        dest.ducats = donor.ducats;
+    }
+    if dest.name_ru.as_ref().is_none_or(|r| !looks_russian(r)) {
+        if donor.name_ru.as_ref().is_some_and(|r| looks_russian(r)) {
+            dest.name_ru = donor.name_ru;
+            dest.display_name = donor.display_name.clone();
+        }
+    }
+    if should_upgrade_mastery_category(&dest.category, &donor.category) {
+        dest.category = donor.category;
+    }
+    for (role, part) in donor.parts {
+        let slot = dest.parts.entry(role.clone()).or_insert(SetPartProgress {
+            role,
+            count: 0,
+            required: 1,
+            url_name: None,
+            name: None,
+            thumb: None,
+        });
+        slot.count += part.count;
+        slot.required = slot.required.max(part.required);
+        if slot.url_name.is_none() {
+            slot.url_name = part.url_name;
+        }
+        if slot.name.is_none() {
+            slot.name = part.name;
+        }
+        if slot.thumb.is_none() {
+            slot.thumb = part.thumb;
         }
     }
 }
@@ -1728,6 +2565,7 @@ fn fill_craft_gear_components(
     craft_gear: &HashMap<String, Vec<CraftGearIng>>,
     inventory: &[InventoryItem],
     lotus: &HashMap<String, String>,
+    lotus_en: &HashMap<String, String>,
     by_norm: &HashMap<String, ItemRow>,
     catalog_by_url: &HashMap<&str, &ItemRow>,
 ) {
@@ -1735,29 +2573,41 @@ fn fill_craft_gear_components(
         return;
     };
     for ing in ings {
-        let leaf = ing.unique.rsplit('/').next().unwrap_or(&ing.unique);
-        let public = warframe_public_leaf(leaf);
-        // Weapons use leaf as-is (BroncoPrime); frames use public map
-        let display_leaf = if ing.unique.contains("/Powersuits/") {
-            public
-        } else {
-            leaf
-        };
-        let ing_key = camel_to_set_key(display_leaf);
+        let unique = fixup_craft_ingredient_unique(&entry.set_key, &ing.unique);
+        let leaf = unique.rsplit('/').next().unwrap_or(&unique);
+        // Prefer public EN name (Bronco Prime → bronco_prime) over Lotus leaf keys.
+        let ing_key = lotus_en
+            .get(&unique)
+            .and_then(|en| en_label_to_set_key(Some(en.as_str())))
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                if unique.contains("/Powersuits/") {
+                    Some(camel_to_set_key(warframe_public_leaf(leaf)))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| camel_to_set_key(leaf));
+        // Drop noisy suffixes from leaf keys (prime_vasto_pistol → try vasto_prime via EN already)
+        let ing_key = normalize_craft_ingredient_key(&ing_key);
         let role = format!("component_{ing_key}");
 
         let owned: i64 = inventory
             .iter()
             .filter(|i| {
                 let u = crate::pricing::strip_inventory_unique(&i.unique_name);
-                u == ing.unique
+                u == unique || u == ing.unique
             })
             .map(|i| i.count)
             .sum();
 
         let mut name = lotus
-            .get(&ing.unique)
+            .get(&unique)
+            .filter(|n| looks_russian(n))
             .cloned()
+            .or_else(|| lotus.get(&ing.unique).filter(|n| looks_russian(n)).cloned())
+            .or_else(|| lotus_en.get(&unique).map(|s| strip_export_tags(s)))
+            .or_else(|| lotus_en.get(&ing.unique).map(|s| strip_export_tags(s)))
             .unwrap_or_else(|| humanize_set_key(&ing_key));
         let mut url_name: Option<String> = None;
 
@@ -1769,8 +2619,18 @@ fn fill_craft_gear_components(
         ];
         for c in &candidates {
             if let Some(row) = catalog_by_url.get(c.as_str()) {
-                url_name = Some(row.url_name.clone());
-                if let Some(ru) = row.name_ru.as_ref().filter(|s| !s.is_empty()) {
+                url_name = Some(
+                    row.set_url_name
+                        .clone()
+                        .filter(|u| u.ends_with("_set"))
+                        .unwrap_or_else(|| row.url_name.clone()),
+                );
+                if let Some(ru) = row
+                    .name_ru
+                    .as_ref()
+                    .filter(|s| looks_russian(s))
+                    .or(row.name_ru.as_ref().filter(|s| !s.is_empty()))
+                {
                     name = strip_part_suffix_name(ru);
                 } else if !row.name.is_empty() {
                     name = strip_part_suffix_name(&row.name);
@@ -1780,29 +2640,88 @@ fn fill_craft_gear_components(
         }
         if url_name.is_none() {
             if let Some(row) = PricingService::resolve_market_item_indexed(&name, by_norm) {
-                url_name = Some(row.url_name.clone());
-                if let Some(ru) = row.name_ru {
+                url_name = Some(
+                    row.set_url_name
+                        .clone()
+                        .filter(|u| u.ends_with("_set"))
+                        .unwrap_or_else(|| row.url_name.clone()),
+                );
+                if let Some(ru) = row.name_ru.as_ref().filter(|s| looks_russian(s)) {
+                    name = strip_part_suffix_name(ru);
+                } else if let Some(ru) = row.name_ru {
                     name = strip_part_suffix_name(&ru);
                 }
             }
         }
+        // Untradeable base weapons (Bronco, Lex, …) are absent from WFM — keep public slug for wiki thumbs.
+        if url_name.is_none() && !ing_key.is_empty() {
+            url_name = Some(ing_key.clone());
+        }
 
+        let thumb = url_name
+            .as_deref()
+            .and_then(|u| catalog_by_url.get(u))
+            .and_then(|r| r.thumb.clone())
+            .or_else(|| {
+                catalog_by_url
+                    .get(ing_key.as_str())
+                    .and_then(|r| r.thumb.clone())
+            })
+            .or_else(|| {
+                let set_slug = format!("{ing_key}_set");
+                catalog_by_url
+                    .get(set_slug.as_str())
+                    .and_then(|r| r.thumb.clone())
+            });
         let part = entry.parts.entry(role.clone()).or_insert(SetPartProgress {
             role: role.clone(),
             count: 0,
             required: ing.count.max(1),
             url_name: url_name.clone(),
             name: Some(name.clone()),
+            thumb: thumb.clone(),
         });
         part.required = ing.count.max(1);
         part.count = owned;
         if part.url_name.is_none() {
             part.url_name = url_name;
         }
-        if part.name.as_deref().unwrap_or("").is_empty() {
-            part.name = Some(name);
+        if part.name.as_ref().is_none_or(|n| n.is_empty() || !looks_russian(n)) {
+            if looks_russian(&name) || part.name.as_ref().is_none_or(|n| n.is_empty()) {
+                part.name = Some(name);
+            }
+        }
+        if part.thumb.is_none() {
+            part.thumb = thumb;
         }
     }
+}
+
+/// DE ExportRecipes occasionally points at the wrong sister weapon (Boltace→BoltoRifle).
+fn fixup_craft_ingredient_unique(set_key: &str, unique: &str) -> String {
+    match (set_key, unique) {
+        (
+            "boltace",
+            "/Lotus/Weapons/Tenno/Rifle/BoltoRifle",
+        ) => "/Lotus/Weapons/Tenno/Pistol/CrossBow".into(), // Bolto, not Boltor
+        _ => unique.to_string(),
+    }
+}
+
+/// `prime_vasto_pistol` / `prime_lex` → `vasto_prime` / `lex_prime` when possible.
+fn normalize_craft_ingredient_key(key: &str) -> String {
+    if let Some(rest) = key.strip_prefix("prime_") {
+        let rest = rest
+            .strip_suffix("_pistol")
+            .or_else(|| rest.strip_suffix("_weapon"))
+            .or_else(|| rest.strip_suffix("_rifle"))
+            .unwrap_or(rest);
+        return format!("{rest}_prime");
+    }
+    key.strip_suffix("_pistol")
+        .or_else(|| key.strip_suffix("_weapon"))
+        .unwrap_or(key)
+        .to_string()
 }
 
 /// DE internal Powersuit leaf → public Warframe name (for UI + WFM slug guesses).
@@ -1830,40 +2749,93 @@ fn warframe_public_leaf(leaf: &str) -> &str {
 
     match base {
         "Anti" => "Nova",
+        "AntiPrime" => "NovaPrime",
+        "Brawler" => "Atlas",
+        "BrawlerPrime" => "AtlasPrime",
         "Berserker" => "Valkyr",
+        "BerserkerPrime" => "ValkyrPrime",
         "Paladin" => "Oberon",
+        "PaladinPrime" => "OberonPrime",
         "Harlequin" => "Mirage",
+        "HarlequinPrime" => "MiragePrime",
         "Necro" => "Nekros",
+        "NecroPrime" => "NekrosPrime",
         "Wraith" => "Sevagoth",
+        "WraithPrime" => "SevagothPrime",
         "Trapper" => "Vauban",
+        "TrapperPrime" => "VaubanPrime",
         "Runner" => "Gauss",
+        "RunnerPrime" => "GaussPrime",
         "Hoplite" => "Styanax",
+        "HoplitePrime" => "StyanaxPrime",
         "Fairy" => "Titania",
+        "FairyPrime" => "TitaniaPrime",
         "Tengu" => "Zephyr",
+        "TenguPrime" => "ZephyrPrime",
         "BrokenFrame" => "Xaku",
+        "BrokenFramePrime" => "XakuPrime",
         "MonkeyKing" => "Wukong",
+        "MonkeyKingPrime" => "WukongPrime",
         "Bard" => "Octavia",
+        "BardPrime" => "OctaviaPrime",
         "Priest" => "Harrow",
+        "PriestPrime" => "HarrowPrime",
         "Ranger" => "Ivara",
+        "RangerPrime" => "IvaraPrime",
         "Odalisk" => "Protea",
+        "OdaliskPrime" => "ProteaPrime",
         "Alchemist" => "Lavos",
+        "AlchemistPrime" => "LavosPrime",
         "Infestation" => "Nidus",
         "InfestationPrime" => "NidusPrime",
         "Ninja" => "Ash",
+        "NinjaPrime" => "AshPrime",
         "YinYang" => "Equinox",
-        "Anima" | "Animus" => "Equinox", // day/night form parts
+        "YinYangPrime" => "EquinoxPrime",
+        "Anima" | "Animus" => "Equinox",
+        "AnimaPrime" | "AnimusPrime" => "EquinoxPrime",
         "Pirate" => "Hydroid",
+        "PiratePrime" => "HydroidPrime",
         "Pacifist" => "Baruuk",
+        "PacifistPrime" => "BaruukPrime",
         "Glass" => "Gara",
-        "IronFrame" | "Ironframe" => "Grendel",
-        "Choir" => "Jade", // /Powersuits/Choir = Jade (not Dante)
+        "GlassPrime" => "GaraPrime",
+        // IronFrame = Hildryn (DE); Grendel = Devourer
+        "IronFrame" | "Ironframe" => "Hildryn",
+        "IronFramePrime" | "IronframePrime" => "HildrynPrime",
+        "Devourer" => "Grendel",
+        "DevourerPrime" => "GrendelPrime",
+        "Choir" => "Jade",
+        "ChoirPrime" => "JadePrime",
         "Pagemaster" => "Dante",
-        "Jade" => "Nyx", // /Powersuits/Jade = Nyx (folder reuse)
+        "PagemasterPrime" => "DantePrime",
+        "Jade" => "Nyx", // folder reuse — Nyx lives under Jade/
+        "JadePrime" => "NyxPrime",
         "ConcreteFrame" | "Concreteframe" => "Qorvex",
+        "ConcreteFramePrime" | "ConcreteframePrime" => "QorvexPrime",
         "Cyte09" => "Cyte-09",
+        "Frumentarius" => "Cyte-09",
         "ExcaliburUmbra" => "Excalibur Umbra",
-        "NechroTech" => "Bonewidow",
-        "StandardJetPack" | "SupportJetPack" | "StealthJetPack" | "DemolitionJetPack" => base, // filtered elsewhere
+        "NechroTech" => "Voidrig",
+        "ThanoTech" => "Bonewidow",
+        "ThanoTechPrime" => "BonewidowPrime",
+        "WolfFrame" | "Werewolf" => "Voruna",
+        "WolfFramePrime" | "WerewolfPrime" => "VorunaPrime",
+        "Mummy" | "Sandman" => "Inaros",
+        "MummyPrime" | "SandmanPrime" => "InarosPrime",
+        "Dragon" => "Chroma",
+        "DragonPrime" => "ChromaPrime",
+        "DemonFrame" => "Uriel",
+        "Inkblot" => "Follie",
+        "Magician" => "Limbo",
+        "MagicianPrime" => "LimboPrime",
+        "Cowgirl" => "Mesa",
+        "CowgirlPrime" => "MesaPrime",
+        "Geode" => "Citrine",
+        "PaxDuviricus" => "Kullervo",
+        "Sentient" => "Caliban",
+        "SentientPrime" => "CalibanPrime",
+        "StandardJetPack" | "SupportJetPack" | "StealthJetPack" | "DemolitionJetPack" => base,
         other => other,
     }
 }
@@ -1881,13 +2853,36 @@ fn camel_to_set_key(name: &str) -> String {
 
 fn part_role_order(category: &str) -> Vec<&'static str> {
     match category {
-        "warframe" => vec!["blueprint", "neuroptics", "chassis", "systems"],
+        "warframe" | "necramech" => {
+            vec!["blueprint", "neuroptics", "chassis", "systems", "casing", "capsule", "weapon_pod", "engine"]
+        }
         "companion" => vec!["blueprint", "carapace", "cerebrum", "systems"],
         "archwing" => vec!["blueprint", "harness", "wings", "systems"],
+        "vehicle" => vec!["blueprint", "engines", "fuselage", "avionics"],
+        "kdrive" | "plexus" => vec!["blueprint"],
+        "intrinsic" => vec![
+            "rank_1", "rank_2", "rank_3", "rank_4", "rank_5", "rank_6", "rank_7", "rank_8",
+            "rank_9", "rank_10",
+        ],
         "modular" => vec!["blueprint", "barrel", "receiver", "handle", "grip", "blade", "link"],
         // Weapons (primary / secondary / melee) and legacy labels
         "primary" | "secondary" | "melee" | "weapon_prime" | "weapon" | "prime" => {
-            vec!["blueprint", "barrel", "receiver", "stock", "link", "blade", "handle"]
+            vec![
+                "blueprint",
+                "barrel",
+                "receiver",
+                "stock",
+                "link",
+                "blade",
+                "handle",
+                "hilt",
+                "gauntlet",
+                "grip",
+                "string",
+                "chain",
+                "ornament",
+                "guard",
+            ]
         }
         _ => vec!["blueprint"],
     }
@@ -1911,6 +2906,7 @@ fn is_component_role(role: &str) -> bool {
             | "string"
             | "pouch"
             | "chain"
+            | "ornament"
             | "hilt"
             | "guard"
             | "head"
@@ -1920,6 +2916,13 @@ fn is_component_role(role: &str) -> bool {
             | "cerebrum"
             | "harness"
             | "wings"
+            | "engines"
+            | "fuselage"
+            | "avionics"
+            | "casing"
+            | "capsule"
+            | "weapon_pod"
+            | "engine"
             | "other"
     )
 }
@@ -1943,6 +2946,7 @@ fn role_from_slug(slug: &str) -> Option<&'static str> {
         ("_string_blueprint", "string"),
         ("_pouch_blueprint", "pouch"),
         ("_chain_blueprint", "chain"),
+        ("_ornament_blueprint", "ornament"),
         ("_hilt_blueprint", "hilt"),
         ("_guard_blueprint", "guard"),
         ("_head_blueprint", "head"),
@@ -1952,6 +2956,13 @@ fn role_from_slug(slug: &str) -> Option<&'static str> {
         ("_cerebrum_blueprint", "cerebrum"),
         ("_harness_blueprint", "harness"),
         ("_wings_blueprint", "wings"),
+        ("_engines_blueprint", "engines"),
+        ("_fuselage_blueprint", "fuselage"),
+        ("_avionics_blueprint", "avionics"),
+        ("_casing_blueprint", "casing"),
+        ("_capsule_blueprint", "capsule"),
+        ("_weapon_pod_blueprint", "weapon_pod"),
+        ("_engine_blueprint", "engine"),
         ("_helmet_blueprint", "neuroptics"),
         ("_neuroptics", "neuroptics"),
         ("_chassis", "chassis"),
@@ -1968,6 +2979,7 @@ fn role_from_slug(slug: &str) -> Option<&'static str> {
         ("_string", "string"),
         ("_pouch", "pouch"),
         ("_chain", "chain"),
+        ("_ornament", "ornament"),
         ("_hilt", "hilt"),
         ("_guard", "guard"),
         ("_head", "head"),
@@ -1977,6 +2989,13 @@ fn role_from_slug(slug: &str) -> Option<&'static str> {
         ("_cerebrum", "cerebrum"),
         ("_harness", "harness"),
         ("_wings", "wings"),
+        ("_engines", "engines"),
+        ("_fuselage", "fuselage"),
+        ("_avionics", "avionics"),
+        ("_casing", "casing"),
+        ("_capsule", "capsule"),
+        ("_weapon_pod", "weapon_pod"),
+        ("_engine", "engine"),
         ("_helmet", "neuroptics"),
         ("_blueprint", "blueprint"),
     ];
@@ -2181,20 +3200,26 @@ fn is_exalted_ability_weapon(path_lower: &str, leaf: &str) -> bool {
     ) {
         return true;
     }
-    // Generic ability-weapon leaf shapes under Powersuits (or Exalted* elsewhere).
-    if path_lower.contains("/powersuits/")
-        && (stem.ends_with("weapon")
-            || stem.ends_with("melee")
-            || stem.ends_with("pistols")
-            || stem.ends_with("sword")
-            || stem.ends_with("bow")
-            || stem.ends_with("staff")
-            || stem.ends_with("fist")
-            || stem.ends_with("claws")
-            || stem.ends_with("book")
-            || stem.ends_with("sniper"))
-    {
-        return true;
+    // CamelCase ability-weapon suffixes under Powersuits.
+    // Must NOT use lowercase `ends_with("fist")` — that false-positives on "Pacifist" (Baruuk).
+    if path_lower.contains("/powersuits/") {
+        let stem_leaf = leaf
+            .strip_suffix("Prime")
+            .or_else(|| leaf.strip_suffix("Umbra"))
+            .unwrap_or(leaf);
+        if stem_leaf.ends_with("Weapon")
+            || stem_leaf.ends_with("Melee")
+            || stem_leaf.ends_with("Pistols")
+            || stem_leaf.ends_with("Sword")
+            || stem_leaf.ends_with("Bow")
+            || stem_leaf.ends_with("Staff")
+            || stem_leaf.ends_with("Fist")
+            || stem_leaf.ends_with("Claws")
+            || stem_leaf.ends_with("Book")
+            || stem_leaf.ends_with("Sniper")
+        {
+            return true;
+        }
     }
     false
 }
@@ -2221,7 +3246,7 @@ fn is_weapon_component_path(lower: &str) -> bool {
 fn seed_warframes_from_lotus(
     groups: &mut HashMap<String, MasterySetBuilder>,
     lotus: &HashMap<String, String>,
-    _lotus_en: &HashMap<String, String>,
+    lotus_en: &HashMap<String, String>,
 ) {
     for (path, name) in lotus {
         let lower = path.to_lowercase();
@@ -2230,19 +3255,37 @@ fn seed_warframes_from_lotus(
             continue;
         }
         let is_arch = lower.contains("/archwing/") || lower.contains("jetpack");
-        let category = if is_arch { "archwing" } else { "warframe" };
-        let public = if is_arch {
-            archwing_public_leaf(leaf).to_string()
+        let is_mech = lower.contains("entratimech")
+            || is_necramech_set_key(&camel_to_set_key(warframe_public_leaf(leaf)));
+        let category = if is_arch {
+            "archwing"
+        } else if is_mech {
+            "necramech"
         } else {
-            warframe_public_leaf(leaf).to_string()
+            "warframe"
         };
-        if public.contains("JetPack") {
+        // Prefer public EN label (Brawler → atlas) over internal Lotus leaf.
+        let key = if is_arch {
+            camel_to_set_key(archwing_public_leaf(leaf))
+        } else {
+            lotus_en
+                .get(path)
+                .and_then(|en| en_label_to_set_key(Some(en.as_str())))
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| camel_to_set_key(warframe_public_leaf(leaf)))
+        };
+        if key.is_empty() || key.contains("jet_pack") || key.contains("orion") || key.contains("sirius")
+        {
             continue;
         }
-        let key = camel_to_set_key(&public);
-        if key.is_empty() {
+        if key == "helminth" {
             continue;
         }
+        let category = if is_necramech_set_key(&key) {
+            "necramech"
+        } else {
+            category
+        };
         let entry = groups
             .entry(key.clone())
             .or_insert_with(|| MasterySetBuilder::new(&key, category));
@@ -2338,9 +3381,11 @@ fn seed_market_sets_from_catalog(
         if key.is_empty() {
             continue;
         }
-        // Cosmetic armor bundles, not mastery gear
+        // Cosmetic armor bundles / non-MR landing crafts / damaged mech salvage
         if key.ends_with("_armor")
             || key.contains("_armor_")
+            || key.contains("damaged_necramech")
+            || is_landing_craft_set_key(&key)
             || row.name.to_lowercase().contains("armor")
                 && row.name.to_lowercase().contains("bundle")
             || row
@@ -2386,8 +3431,14 @@ fn seed_market_sets_from_catalog(
 
         let category = if has_companion {
             "companion"
+        } else if is_necramech_set_key(&key) {
+            "necramech"
         } else if has_frame && !has_weapon {
-            "warframe"
+            if is_necramech_set_key(&key) {
+                "necramech"
+            } else {
+                "warframe"
+            }
         } else {
             "primary"
         };
@@ -2399,6 +3450,8 @@ fn seed_market_sets_from_catalog(
             // keep companion
         } else if entry.category == "warframe" && category == "primary" {
             // keep warframe
+        } else if entry.category == "necramech" && category == "primary" {
+            // keep necramech
         } else if should_upgrade_mastery_category(&entry.category, category)
             || entry.category.is_empty()
             || (entry.category == "primary" && category == "warframe")
@@ -2409,8 +3462,94 @@ fn seed_market_sets_from_catalog(
     }
 }
 
+/// Build set_url → part rows once (avoids O(sets × catalog) scans).
+fn index_catalog_parts_by_set(catalog: &[ItemRow]) -> HashMap<String, Vec<&ItemRow>> {
+    let mut map: HashMap<String, Vec<&ItemRow>> = HashMap::new();
+    for row in catalog {
+        if row.url_name.ends_with("_set") {
+            continue;
+        }
+        let parent = row
+            .set_url_name
+            .as_deref()
+            .and_then(canonicalize_set_slug)
+            .or_else(|| canonicalize_set_slug(&row.url_name));
+        if let Some(parent) = parent {
+            map.entry(parent).or_default().push(row);
+        }
+    }
+    map
+}
+
+/// Apply DE foundry part quantities (blade×2 etc.) and create missing roles (ornament).
+fn apply_craft_part_quantities(
+    entry: &mut MasterySetBuilder,
+    craft_part_qty: &HashMap<String, HashMap<String, i64>>,
+    slug_ru: &HashMap<String, String>,
+) {
+    let Some(roles) = craft_part_qty.get(&entry.set_key) else {
+        return;
+    };
+    let set_title = entry
+        .name_ru
+        .as_deref()
+        .filter(|s| looks_russian(s))
+        .unwrap_or(entry.display_name.as_str());
+
+    for (role, need) in roles {
+        let need = (*need).max(1);
+        let target = resolve_qty_role_slot(entry, role);
+        if let Some(part) = entry.parts.get_mut(&target) {
+            part.required = part.required.max(need);
+            continue;
+        }
+        // Create missing catalog roles (Tipedo ornament, …) when we already track the set
+        // or DE requires multiples.
+        let has_any_part = !entry.parts.is_empty();
+        if !has_any_part && need <= 1 {
+            continue;
+        }
+        let url_guess = format!("{}_{}", entry.set_key, target);
+        let name = synthesized_part_name(set_title, &target, slug_ru, &entry.set_key);
+        entry.parts.insert(
+            target.clone(),
+            SetPartProgress {
+                role: target,
+                count: 0,
+                required: need,
+                url_name: Some(url_guess),
+                name: Some(name),
+                thumb: None,
+            },
+        );
+    }
+}
+
+/// Map DE role onto an existing slot when WFM uses an alias (handle↔hilt, grip↔handle).
+fn resolve_qty_role_slot(entry: &MasterySetBuilder, role: &str) -> String {
+    if entry.parts.contains_key(role) {
+        return role.to_string();
+    }
+    let aliases: &[&str] = match role {
+        "handle" => &["hilt", "grip"],
+        "hilt" => &["handle"],
+        "grip" => &["handle", "hilt"],
+        "stock" => &["grip"],
+        _ => &[],
+    };
+    for a in aliases {
+        if entry.parts.contains_key(*a) {
+            return (*a).to_string();
+        }
+    }
+    role.to_string()
+}
+
 /// Ensure weapon/frame sets expose every catalog part slot (even at count 0).
-fn fill_slots_from_catalog(entry: &mut MasterySetBuilder, catalog: &[ItemRow]) {
+fn fill_slots_from_catalog(
+    entry: &mut MasterySetBuilder,
+    parts_by_set: &HashMap<String, Vec<&ItemRow>>,
+) {
     let set_key = entry.set_key.clone();
     let set_url = entry
         .url_name
@@ -2424,53 +3563,41 @@ fn fill_slots_from_catalog(entry: &mut MasterySetBuilder, catalog: &[ItemRow]) {
     if !set_url.ends_with("_set") {
         return;
     }
-    for row in catalog {
-        if row.url_name.ends_with("_set") {
-            continue;
+    let rows = parts_by_set.get(&set_url).map(|v| v.as_slice()).unwrap_or(&[]);
+    if rows.is_empty() {
+        // Rare fallback: parent key equals set_key but set_url guess differed
+        for (parent, rows) in parts_by_set {
+            let parent_key = parent.strip_suffix("_set").unwrap_or(parent.as_str());
+            if parent_key != set_key.as_str() {
+                continue;
+            }
+            for row in rows {
+                fill_one_catalog_part(entry, row);
+            }
+            break;
         }
-        let parent = row
-            .set_url_name
-            .as_deref()
-            .and_then(canonicalize_set_slug)
-            .or_else(|| canonicalize_set_slug(&row.url_name));
-        // Match by canonical parent set only. Do NOT use a bare `{set_key}_` prefix —
-        // that wrongly pulls `odonata_prime_*` into the `odonata` set.
-        let belongs = parent.as_deref() == Some(set_url.as_str())
-            || catalog_part_belongs_to_set_key(&row.url_name, &set_key);
-        if !belongs {
-            continue;
+    } else {
+        for row in rows {
+            fill_one_catalog_part(entry, row);
         }
-        let Some(role) = role_from_slug(&row.url_name) else {
-            continue;
-        };
-        entry.parts.entry(role.to_string()).or_insert(SetPartProgress {
-            role: role.into(),
-            count: 0,
-            required: 1,
-            url_name: Some(row.url_name.clone()),
-            name: Some(row.name_ru.clone().unwrap_or_else(|| row.name.clone())),
-        });
     }
 
     // Prefer weapon category when catalog parts are weapon-like
     if entry.category == "prime" || entry.category == "warframe" {
-        let companionish = entry.parts.keys().any(|r| {
-            matches!(r.as_str(), "carapace" | "cerebrum")
-        });
+        let companionish = entry
+            .parts
+            .keys()
+            .any(|r| matches!(r.as_str(), "carapace" | "cerebrum"));
         let weaponish = entry.parts.keys().any(|r| {
             matches!(
                 r.as_str(),
-                "barrel"
-                    | "receiver"
-                    | "stock"
-                    | "link"
-                    | "blade"
-                    | "handle"
+                "barrel" | "receiver" | "stock" | "link" | "blade" | "handle"
             )
         });
-        let frameish = entry.parts.keys().any(|r| {
-            matches!(r.as_str(), "neuroptics" | "chassis" | "systems")
-        });
+        let frameish = entry
+            .parts
+            .keys()
+            .any(|r| matches!(r.as_str(), "neuroptics" | "chassis" | "systems"));
         if companionish {
             entry.category = "companion".into();
         } else if weaponish && !frameish {
@@ -2479,44 +3606,210 @@ fn fill_slots_from_catalog(entry: &mut MasterySetBuilder, catalog: &[ItemRow]) {
     }
 }
 
-/// `{set_key}_harness_blueprint` belongs to `amesha`; `{set_key}_prime_*` does not.
-fn catalog_part_belongs_to_set_key(url: &str, set_key: &str) -> bool {
-    let expected = format!("{set_key}_set");
-    if canonicalize_set_slug(url).as_deref() == Some(expected.as_str()) {
-        return true;
-    }
-    let Some(rest) = url.strip_prefix(&format!("{set_key}_")) else {
-        return false;
+fn fill_one_catalog_part(entry: &mut MasterySetBuilder, row: &ItemRow) {
+    let Some(role) = role_from_slug(&row.url_name) else {
+        return;
     };
-    let head = rest.split('_').next().unwrap_or("");
-    matches!(
-        head,
-        "blueprint"
-            | "neuroptics"
-            | "chassis"
-            | "systems"
-            | "harness"
-            | "wings"
-            | "barrel"
-            | "receiver"
-            | "reciever"
-            | "stock"
-            | "link"
-            | "blade"
-            | "handle"
-            | "gauntlet"
-            | "grip"
-            | "string"
-            | "pouch"
-            | "chain"
-            | "hilt"
-            | "guard"
-            | "head"
-            | "lower"
-            | "upper"
-            | "carapace"
-            | "cerebrum"
-    )
+    let role_owned = role.to_string();
+    let preferred_name = normalize_catalog_part_name(
+        row.name_ru
+            .as_ref()
+            .filter(|s| looks_russian(s))
+            .cloned()
+            .or_else(|| row.name_ru.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| row.name.clone()),
+        role,
+    );
+    entry
+        .parts
+        .entry(role_owned.clone())
+        .or_insert(SetPartProgress {
+            role: role_owned.clone(),
+            count: 0,
+            required: 1,
+            url_name: Some(row.url_name.clone()),
+            name: Some(preferred_name.clone()),
+            thumb: row.thumb.clone(),
+        });
+    if let Some(part) = entry.parts.get_mut(&role_owned) {
+        if part.thumb.is_none() {
+            part.thumb = row.thumb.clone();
+        }
+        if part.url_name.is_none() {
+            part.url_name = Some(row.url_name.clone());
+        }
+        // Prefer Russian over leftover English WFM names
+        if part.name.as_ref().is_none_or(|n| n.is_empty() || !looks_russian(n)) {
+            if looks_russian(&preferred_name) || part.name.as_ref().is_none_or(|n| n.is_empty()) {
+                part.name = Some(preferred_name);
+            }
+        }
+    }
+}
+
+/// Fill classic craft slots for base frames / sentinels that are not on WFM.
+fn synthesize_missing_craft_slots(entry: &mut MasterySetBuilder, slug_ru: &HashMap<String, String>) {
+    // Never invent companion-style slots for sentinel weapons mis-labeled earlier.
+    if matches!(
+        entry.category.as_str(),
+        "primary" | "secondary" | "melee" | "modular"
+    ) {
+        return;
+    }
+    let roles: &[&str] = match entry.category.as_str() {
+        "warframe" => &["blueprint", "neuroptics", "chassis", "systems"],
+        "necramech" => &["blueprint", "casing", "systems", "engine", "weapon_pod"],
+        "companion" => &["blueprint", "carapace", "cerebrum", "systems"],
+        "vehicle" => &["blueprint", "engines", "fuselage", "avionics"],
+        "archwing" => {
+            let weaponish = entry.parts.keys().any(|r| {
+                matches!(
+                    r.as_str(),
+                    "barrel" | "receiver" | "stock" | "blade" | "handle" | "link"
+                )
+            });
+            if weaponish {
+                return;
+            }
+            &["blueprint", "harness", "wings", "systems"]
+        }
+        _ => return,
+    };
+
+    let set_title = entry
+        .name_ru
+        .as_deref()
+        .filter(|s| looks_russian(s))
+        .unwrap_or(entry.display_name.as_str());
+
+    for role in roles {
+        if entry.parts.contains_key(*role) {
+            continue;
+        }
+        let url_guess = match *role {
+            "blueprint" => format!("{}_blueprint", entry.set_key),
+            "neuroptics" => format!("{}_neuroptics_blueprint", entry.set_key),
+            other => format!("{}_{}", entry.set_key, other),
+        };
+        let url_guess = crate::pricing::normalize_market_slug(&url_guess);
+        let name = synthesized_part_name(set_title, role, slug_ru, &entry.set_key);
+        entry.parts.insert(
+            (*role).to_string(),
+            SetPartProgress {
+                role: (*role).into(),
+                count: 0,
+                required: 1,
+                url_name: Some(url_guess),
+                name: Some(name),
+                thumb: None,
+            },
+        );
+    }
+}
+
+fn role_label_ru(role: &str) -> &'static str {
+    match role {
+        "blueprint" => "Чертеж",
+        "neuroptics" => "Нейрооптика",
+        "chassis" => "Каркас",
+        "systems" => "Система",
+        "carapace" => "Панцирь",
+        "cerebrum" => "Мозг",
+        "harness" => "Упряжь",
+        "wings" => "Крылья",
+        "engines" => "Двигатели",
+        "fuselage" => "Фюзеляж",
+        "avionics" => "Авионика",
+        "casing" => "Каркас",
+        "capsule" => "Капсула",
+        "weapon_pod" => "Оружейная капсула",
+        "engine" => "Двигатель",
+        "barrel" => "Ствол",
+        "receiver" => "Приёмник",
+        "stock" => "Приклад",
+        "blade" => "Клинок",
+        "handle" => "Рукоять",
+        "link" => "Связь",
+        "gauntlet" => "Перчатка",
+        "grip" => "Рукоять",
+        "string" => "Тетива",
+        "chain" => "Цепь",
+        "ornament" => "Украшение",
+        "hilt" => "Эфес",
+        "guard" => "Гарда",
+        "head" => "Навершие",
+        _ => "Часть",
+    }
+}
+
+fn synthesized_part_name(
+    set_title: &str,
+    role: &str,
+    slug_ru: &HashMap<String, String>,
+    set_key: &str,
+) -> String {
+    let mut title = if looks_russian(set_title) {
+        set_title.trim().to_string()
+    } else if let Some(ru) = slug_ru.get(set_key) {
+        ru.clone()
+    } else if set_key.ends_with("_prime") {
+        let base = set_key.trim_end_matches("_prime");
+        slug_ru
+            .get(base)
+            .map(|r| format!("{r} Прайм"))
+            .unwrap_or_else(|| set_title.trim().to_string())
+    } else {
+        set_title.trim().to_string()
+    };
+    title = strip_part_suffix_name(&title);
+    // Drop leftover role suffixes that strip_part_suffix_name missed
+    for suf in [
+        ": Каркас",
+        ": Нейрооптика",
+        ": Система",
+        ": Панцирь",
+        ": Мозг",
+        ": Упряжь",
+        ": Крылья",
+    ] {
+        if let Some(s) = title.strip_suffix(suf) {
+            title = s.trim().to_string();
+        }
+    }
+    let role_ru = role_label_ru(role);
+    if role == "blueprint" {
+        format!("{title} ({role_ru})")
+    } else {
+        format!("{title}: {role_ru}")
+    }
+}
+
+/// Ensure every part label is Russian when we can synthesize or already have RU.
+fn localize_part_names(entry: &mut MasterySetBuilder, slug_ru: &HashMap<String, String>) {
+    let set_title = entry
+        .name_ru
+        .as_deref()
+        .filter(|s| looks_russian(s))
+        .unwrap_or(entry.display_name.as_str())
+        .to_string();
+    for (role, part) in entry.parts.iter_mut() {
+        if role.starts_with("component_") {
+            continue;
+        }
+        let needs_ru = part
+            .name
+            .as_ref()
+            .is_none_or(|n| n.is_empty() || !looks_russian(n));
+        if !needs_ru {
+            continue;
+        }
+        part.name = Some(synthesized_part_name(
+            &set_title,
+            role,
+            slug_ru,
+            &entry.set_key,
+        ));
+    }
 }
 
 fn part_role_from(unique_l: &str, name_l: &str) -> String {
@@ -2625,6 +3918,7 @@ fn leaf_set_key(unique: &str) -> String {
         "Gauntlet",
         "Pouch",
         "Chain",
+        "Ornament",
         "Hilt",
         "Guard",
         "Head",
@@ -2691,18 +3985,31 @@ fn strip_part_suffix_name(name: &str) -> String {
         " Blade",
         " Handle",
         " Gauntlet",
+        " Ornament",
+        " Chain",
+        " Hilt",
+        " Guard",
         ": Нейрооптика (Чертеж)",
         ": Каркас (Чертеж)",
         ": Система (Чертеж)",
         ": Нейрооптика",
         ": Каркас",
         ": Система",
+        ": Панцирь",
+        ": Мозг",
+        ": Упряжь",
+        ": Крылья",
         ": Приёмник",
         ": Ствол",
         ": Приклад",
         ": Связь",
         ": Клинок",
         ": Рукоять",
+        ": Украшение",
+        ": Орнамент",
+        ": Цепь",
+        ": Эфес",
+        ": Гарда",
         " (Чертеж)",
         ": Комплект",
     ] {
@@ -2713,9 +4020,485 @@ fn strip_part_suffix_name(name: &str) -> String {
     n
 }
 
+/// Fix inverted WFM labels like "Орнамент: Типедо Прайм" → "Типедо Прайм: Украшение".
+fn normalize_catalog_part_name(name: String, role: &str) -> String {
+    let n = name.trim();
+    if let Some(rest) = n
+        .strip_prefix("Орнамент:")
+        .or_else(|| n.strip_prefix("Ornament:"))
+    {
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            return format!("{rest}: {}", role_label_ru(role));
+        }
+    }
+    n.to_string()
+}
+
 fn strip_prime_label(name: &str) -> String {
     name.replace(" Прайм", "")
         .replace(" Prime", "")
         .trim()
         .to_string()
+}
+
+fn is_robotic_weapon_path(lower: &str) -> bool {
+    (lower.contains("moapet") && lower.contains("weapon"))
+        || lower.contains("zanukapetmelee")
+        || lower.contains("hextraweapon")
+        || lower.contains("cryoxion")
+        || lower.contains("swarmerweapon")
+        || lower.contains("tazronweapon")
+        || lower.contains("thermocormoa")
+}
+
+fn is_mr_amp_path(lower: &str) -> bool {
+    if lower.contains("blueprint") || lower.contains("/recipes/") {
+        return false;
+    }
+    (lower.contains("ampset") && lower.contains("barrel"))
+        || lower.contains("sentamptrainingbarrel")
+        || lower.contains("drifterpistol")
+        || lower.contains("operatortrainingampweapon")
+}
+
+fn is_mr_kitgun_chamber_path(lower: &str) -> bool {
+    if lower.contains("blueprint") || lower.contains("/recipes/") {
+        return false;
+    }
+    (lower.contains("sumodular") && lower.contains("barrel"))
+        || (lower.contains("infkitgun") && lower.contains("barrel"))
+        || lower.contains("infmodularbarrel")
+}
+
+fn is_mr_zaw_strike_path(lower: &str) -> bool {
+    if lower.contains("blueprint") || lower.contains("/recipes/") {
+        return false;
+    }
+    (lower.contains("modularmelee") && lower.contains("/tip/"))
+        || (lower.contains("modularmeleeinfested") && lower.contains("/tips/"))
+}
+
+fn is_kdrive_set_key(key: &str) -> bool {
+    matches!(
+        key,
+        "bad_baby" | "flatbelly" | "needlenose" | "runway" | "feverspine"
+    )
+}
+
+fn is_amp_kitgun_zaw_key(key: &str) -> bool {
+    matches!(
+        key,
+        "cantic"
+            | "granmu"
+            | "klamora"
+            | "lega"
+            | "mote"
+            | "rahn"
+            | "raplak"
+            | "shwaak"
+            | "sirocco"
+            | "catchmoon"
+            | "gaze"
+            | "rattleguts"
+            | "tombfinger"
+            | "sporelacer"
+            | "vermisplicer"
+            | "balla"
+            | "cyath"
+            | "dehtat"
+            | "dokrahm"
+            | "kronsh"
+            | "mewan"
+            | "ooltha"
+            | "plague_keewar"
+            | "plague_kripath"
+            | "rabvee"
+            | "sepfahn"
+    )
+}
+
+fn is_non_mr_modular_part(key: &str, name: &str) -> bool {
+    if is_amp_kitgun_zaw_key(key) || is_kdrive_set_key(key) {
+        return false;
+    }
+    let k = key;
+    let n = name;
+    k.contains("chassis")
+        || k.contains("grip")
+        || n.contains("подлож")
+        || n.contains("фиксатор")
+        || (k.contains("amp") && (k.contains("chassis") || k.contains("grip")))
+        || k.contains("clip")
+        || k.contains("loader")
+        || (k.contains("handle")
+            && (k.contains("kit") || k.contains("modular") || k.contains("inf")))
+        || k.contains("plague_akwin")
+        || k.contains("plague_bokwin")
+        || (k.contains("hoverboard")
+            && (k.contains("jet") || k.contains("engine") || k.contains("front")))
+        || k == "operator_amp_weapon"
+        || k == "su_modular_primary_handle_d_part"
+        || (k.contains("sent_amp_set") && (k.contains("chassis") || k.contains("grip")))
+        || (k.contains("corp_amp_set") && (k.contains("chassis") || k.contains("grip")))
+}
+
+/// Map inventory leaf → public MR set key for amps / kitguns / zaw tips / boards.
+fn remap_modular_mastery_key(set_key: &str, item: &InventoryItem) -> Option<String> {
+    let unique = item.unique_name.split('#').next().unwrap_or(&item.unique_name);
+    let lower = unique.to_lowercase();
+    if lower.contains("blueprint") || lower.contains("/recipes/") || item.unique_name.contains('#')
+    {
+        // Recipes / MiscItems suffixes — never an MR carrier.
+        if item.unique_name.contains("#Recipes")
+            || item.unique_name.contains("#MiscItems")
+            || lower.contains("blueprint")
+        {
+            return None;
+        }
+    }
+    let leaf = unique.rsplit('/').next().unwrap_or(unique);
+
+    if let Some(k) = amp_key_from_path(&lower, leaf) {
+        return Some(k);
+    }
+    if let Some(k) = kitgun_key_from_path(&lower, leaf) {
+        return Some(k);
+    }
+    if let Some(k) = zaw_key_from_path(&lower, leaf) {
+        return Some(k);
+    }
+    if let Some(k) = kdrive_key_from_path(&lower, leaf) {
+        return Some(k);
+    }
+    if lower.contains("defaultharness") {
+        return Some("plexus".into());
+    }
+    if set_key == "sirocco" || lower.contains("drifterpistol") {
+        return Some("sirocco".into());
+    }
+    None
+}
+
+fn remap_modular_mastery_category(set_key: &str, fallback: &str) -> String {
+    if is_kdrive_set_key(set_key) {
+        return "kdrive".into();
+    }
+    if set_key == "plexus" {
+        return "plexus".into();
+    }
+    if matches!(
+        set_key,
+        "cantic"
+            | "granmu"
+            | "klamora"
+            | "lega"
+            | "mote"
+            | "rahn"
+            | "raplak"
+            | "shwaak"
+            | "sirocco"
+            | "catchmoon"
+            | "gaze"
+            | "rattleguts"
+            | "tombfinger"
+            | "sporelacer"
+            | "vermisplicer"
+    ) {
+        return "modular".into();
+    }
+    if matches!(
+        set_key,
+        "balla"
+            | "cyath"
+            | "dehtat"
+            | "dokrahm"
+            | "kronsh"
+            | "mewan"
+            | "ooltha"
+            | "plague_keewar"
+            | "plague_kripath"
+            | "rabvee"
+            | "sepfahn"
+    ) {
+        return "melee".into();
+    }
+    fallback.to_string()
+}
+
+fn amp_key_from_path(lower: &str, leaf: &str) -> Option<String> {
+    let leaf_l = leaf.to_ascii_lowercase();
+    if leaf_l.contains("corpampset1barrelparta") {
+        return Some("cantic".into());
+    }
+    if leaf_l.contains("sentampset1barrelpartc") {
+        return Some("granmu".into());
+    }
+    if leaf_l.contains("corpampset1barrelpartc") {
+        return Some("klamora".into());
+    }
+    if leaf_l.contains("corpampset1barrelpartb") {
+        return Some("lega".into());
+    }
+    if leaf_l.contains("sentamptrainingbarrel") || leaf_l.contains("operatortrainingamp") {
+        return Some("mote".into());
+    }
+    if leaf_l.contains("sentampset2barrelparta") {
+        return Some("rahn".into());
+    }
+    if leaf_l.contains("sentampset1barrelparta") {
+        return Some("raplak".into());
+    }
+    if leaf_l.contains("sentampset1barrelpartb") {
+        return Some("shwaak".into());
+    }
+    if lower.contains("drifterpistol") {
+        return Some("sirocco".into());
+    }
+    let _ = lower;
+    None
+}
+
+fn kitgun_key_from_path(lower: &str, leaf: &str) -> Option<String> {
+    let leaf_l = leaf.to_ascii_lowercase();
+    if leaf_l.contains("barrelapart") && lower.contains("sumodularsecondary") {
+        return Some("catchmoon".into());
+    }
+    if leaf_l.contains("barreldpart") && lower.contains("sumodularsecondary") {
+        return Some("gaze".into());
+    }
+    if leaf_l.contains("barrelcpart") && lower.contains("sumodularsecondary") {
+        return Some("rattleguts".into());
+    }
+    if leaf_l.contains("barrelbpart") && lower.contains("sumodularsecondary") {
+        return Some("tombfinger".into());
+    }
+    if leaf_l.contains("infmodularbarrelegg") {
+        return Some("sporelacer".into());
+    }
+    if leaf_l.contains("infmodularbarrelbeam") {
+        return Some("vermisplicer".into());
+    }
+    None
+}
+
+fn zaw_key_from_path(lower: &str, leaf: &str) -> Option<String> {
+    if !is_mr_zaw_strike_path(lower) || lower.contains("pvpvariant") {
+        return None;
+    }
+    let leaf_l = leaf.to_ascii_lowercase();
+    let key = match leaf_l.as_str() {
+        "tipone" => "balla",
+        "tipfour" => "cyath",
+        "tipfive" => "dehtat",
+        "tipeleven" => "dokrahm",
+        "tipsix" => "kronsh",
+        "tipthree" => "mewan",
+        "tiptwo" => "ooltha",
+        "infestedtiptwo" => "plague_keewar",
+        "infestedtipone" => "plague_kripath",
+        "tipten" => "rabvee",
+        "tipnine" => "sepfahn",
+        _ => return None,
+    };
+    Some(key.into())
+}
+
+fn kdrive_key_from_path(lower: &str, leaf: &str) -> Option<String> {
+    if !(lower.contains("hoverboard") && lower.contains("deck")) {
+        return None;
+    }
+    let leaf_l = leaf.to_ascii_lowercase();
+    if leaf_l.contains("solarisa") {
+        return Some("bad_baby".into());
+    }
+    if leaf_l.contains("corpusa") {
+        return Some("flatbelly".into());
+    }
+    if leaf_l.contains("corpusb") {
+        return Some("needlenose".into());
+    }
+    if leaf_l.contains("corpusc") {
+        return Some("runway".into());
+    }
+    if leaf_l.contains("infestedb") {
+        return Some("feverspine".into());
+    }
+    None
+}
+
+fn seed_amp_kitgun_zaw_roster(
+    groups: &mut HashMap<String, MasterySetBuilder>,
+    lotus: &HashMap<String, String>,
+) {
+    const AMPS: &[(&str, &str, &str)] = &[
+        ("cantic", "Cantic", "Кантик"),
+        ("granmu", "Granmu", "Гранму"),
+        ("klamora", "Klamora", "Кламора"),
+        ("lega", "Lega", "Лега"),
+        ("mote", "Mote", "Пылинка"),
+        ("rahn", "Rahn", "Ран"),
+        ("raplak", "Raplak", "Раплак"),
+        ("shwaak", "Shwaak", "Шваак"),
+        ("sirocco", "Sirocco", "Сирокко"),
+    ];
+    for (key, en, ru) in AMPS {
+        upsert_roster_entry(groups, key, "modular", en, ru, lotus);
+    }
+    const KITGUNS: &[(&str, &str, &str)] = &[
+        ("catchmoon", "Catchmoon", "Катчмун"),
+        ("gaze", "Gaze", "Гейз"),
+        ("rattleguts", "Rattleguts", "Раттлгатс"),
+        ("tombfinger", "Tombfinger", "Томбфингер"),
+        ("sporelacer", "Sporelacer", "Споромет"),
+        ("vermisplicer", "Vermisplicer", "Вермисплицер"),
+    ];
+    for (key, en, ru) in KITGUNS {
+        upsert_roster_entry(groups, key, "modular", en, ru, lotus);
+    }
+    const ZAWS: &[(&str, &str, &str)] = &[
+        ("balla", "Balla", "Балла"),
+        ("cyath", "Cyath", "Циат"),
+        ("dehtat", "Dehtat", "Дехтат"),
+        ("dokrahm", "Dokrahm", "Докрам"),
+        ("kronsh", "Kronsh", "Кронш"),
+        ("mewan", "Mewan", "Меван"),
+        ("ooltha", "Ooltha", "Улта"),
+        ("plague_keewar", "Plague Keewar", "Чумной Кивар"),
+        ("plague_kripath", "Plague Kripath", "Чумной Крипат"),
+        ("rabvee", "Rabvee", "Рабви"),
+        ("sepfahn", "Sepfahn", "Сепфан"),
+    ];
+    for (key, en, ru) in ZAWS {
+        upsert_roster_entry(groups, key, "melee", en, ru, lotus);
+    }
+}
+
+fn seed_kdrives(groups: &mut HashMap<String, MasterySetBuilder>, lotus: &HashMap<String, String>) {
+    const BOARDS: &[(&str, &str, &str)] = &[
+        ("bad_baby", "Bad Baby", "Плохая детка"),
+        ("flatbelly", "Flatbelly", "Плоскопуз"),
+        ("needlenose", "Needlenose", "Иглонос"),
+        ("runway", "Runway", "Взлётка"),
+        ("feverspine", "Feverspine", "Спинотряс"),
+    ];
+    for (key, en, ru) in BOARDS {
+        upsert_roster_entry(groups, key, "kdrive", en, ru, lotus);
+    }
+}
+
+fn seed_plexus(groups: &mut HashMap<String, MasterySetBuilder>, lotus: &HashMap<String, String>) {
+    upsert_roster_entry(groups, "plexus", "plexus", "Plexus", "Плексус", lotus);
+}
+
+fn upsert_roster_entry(
+    groups: &mut HashMap<String, MasterySetBuilder>,
+    key: &str,
+    category: &str,
+    en: &str,
+    ru: &str,
+    _lotus: &HashMap<String, String>,
+) {
+    let entry = groups
+        .entry(key.into())
+        .or_insert_with(|| MasterySetBuilder::new(key, category));
+    entry.category = category.into();
+    if entry.display_name == humanize_set_key(key) || entry.display_name.is_empty() {
+        entry.display_name = en.into();
+    }
+    if entry.name_ru.is_none() {
+        entry.name_ru = Some(ru.into());
+    }
+}
+
+fn seed_companion_weapons_from_lotus(
+    groups: &mut HashMap<String, MasterySetBuilder>,
+    lotus: &HashMap<String, String>,
+    lotus_en: &HashMap<String, String>,
+) {
+    for (path, en_name) in lotus_en {
+        let lower = path.to_lowercase();
+        if !(is_sentinel_weapon_path(&lower) || is_robotic_weapon_path(&lower)) {
+            continue;
+        }
+        if is_weapon_component_path(&lower) || lower.contains("blueprint") {
+            continue;
+        }
+        let en_l = en_name.to_lowercase();
+        let cat = infer_weapon_slot_category(&lower, &en_l);
+        let Some(key) = en_label_to_set_key(Some(en_name.as_str())) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let entry = groups
+            .entry(key.clone())
+            .or_insert_with(|| MasterySetBuilder::new(&key, cat));
+        if matches!(entry.category.as_str(), "warframe" | "companion") {
+            continue;
+        }
+        if should_upgrade_mastery_category(&entry.category, cat) || entry.category.is_empty() {
+            entry.category = cat.into();
+        }
+        if let Some(ru) = lotus.get(path) {
+            apply_lotus_display_name(entry, ru, true);
+        } else if entry.display_name == humanize_set_key(&entry.set_key) {
+            entry.display_name = strip_export_tags(en_name);
+        }
+    }
+}
+
+fn seed_intrinsics(
+    groups: &mut HashMap<String, MasterySetBuilder>,
+    skills: Option<&serde_json::Value>,
+) {
+    const RJ: &[(&str, &str, &str, &str)] = &[
+        ("rj_tactical", "LPS_TACTICAL", "Tactical", "Тактика"),
+        ("rj_piloting", "LPS_PILOTING", "Piloting", "Пилотирование"),
+        ("rj_gunnery", "LPS_GUNNERY", "Gunnery", "Наведение"),
+        ("rj_engineering", "LPS_ENGINEERING", "Engineering", "Инженерия"),
+        ("rj_command", "LPS_COMMAND", "Command", "Командование"),
+    ];
+    const DRIFT: &[(&str, &str, &str, &str)] = &[
+        ("drifter_combat", "LPS_DRIFT_COMBAT", "Combat", "Бой"),
+        ("drifter_riding", "LPS_DRIFT_RIDING", "Riding", "Верховая езда"),
+        ("drifter_opportunity", "LPS_DRIFT_OPPORTUNITY", "Opportunity", "Удача"),
+        ("drifter_endurance", "LPS_DRIFT_ENDURANCE", "Endurance", "Выносливость"),
+    ];
+
+    let rank_of = |key: &str| -> i64 {
+        skills
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .clamp(0, 10)
+    };
+
+    for (set_key, skill_key, en, ru) in RJ.iter().chain(DRIFT.iter()) {
+        let rank = rank_of(skill_key);
+        let entry = groups
+            .entry((*set_key).into())
+            .or_insert_with(|| MasterySetBuilder::new(set_key, "intrinsic"));
+        entry.category = "intrinsic".into();
+        entry.display_name = format!("Intrinsic: {en}");
+        entry.name_ru = Some(format!("Интринсик: {ru}"));
+        entry.owned = rank > 0;
+        entry.mastered = rank >= 10;
+        entry.parts.clear();
+        for i in 1..=10 {
+            let role = format!("rank_{i}");
+            entry.parts.insert(
+                role.clone(),
+                SetPartProgress {
+                    role,
+                    count: if rank >= i { 1 } else { 0 },
+                    required: 1,
+                    url_name: None,
+                    name: Some(format!("Ранг {i}")),
+                    thumb: None,
+                },
+            );
+        }
+    }
 }

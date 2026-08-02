@@ -5,9 +5,11 @@
 
 const PART_SUFFIXES: { suffix: string; role: string; file: string }[] = [
   { suffix: '_neuroptics_blueprint', role: 'neuroptics', file: 'Helmet.png' },
+  { suffix: '_helmet_blueprint', role: 'neuroptics', file: 'Helmet.png' },
   { suffix: '_chassis_blueprint', role: 'chassis', file: 'Chassis.png' },
   { suffix: '_systems_blueprint', role: 'systems', file: 'Systems.png' },
   { suffix: '_neuroptics', role: 'neuroptics', file: 'Helmet.png' },
+  { suffix: '_helmet', role: 'neuroptics', file: 'Helmet.png' },
   { suffix: '_chassis', role: 'chassis', file: 'Chassis.png' },
   { suffix: '_systems', role: 'systems', file: 'Systems.png' },
   { suffix: '_blueprint', role: 'blueprint', file: 'Blueprint.png' },
@@ -18,7 +20,7 @@ const PART_SUFFIXES: { suffix: string; role: string; file: string }[] = [
   { suffix: '_stock', role: 'stock', file: 'Stock.png' },
   { suffix: '_blade', role: 'blade', file: 'Blade.png' },
   { suffix: '_handle', role: 'handle', file: 'Handle.png' },
-  { suffix: '_link', role: 'link', file: 'Receiver.png' },
+  { suffix: '_link', role: 'link', file: 'Stock.png' },
   { suffix: '_gauntlet', role: 'gauntlet', file: 'Blade.png' },
   { suffix: '_grip', role: 'grip', file: 'Handle.png' },
   { suffix: '_string', role: 'string', file: 'Stock.png' },
@@ -44,12 +46,13 @@ const ROLE_FILE: Record<string, string> = {
   stock: 'Stock.png',
   blade: 'Blade.png',
   handle: 'Handle.png',
-  link: 'Receiver.png',
+  link: 'Stock.png', // Link.png missing on wiki; Stock is distinct from Barrel/Receiver
   gauntlet: 'Blade.png',
   grip: 'Handle.png',
   string: 'Stock.png',
   pouch: 'Receiver.png',
   chain: 'Blade.png',
+  ornament: 'Handle.png',
   hilt: 'Handle.png',
   guard: 'Blade.png',
   head: 'Blade.png',
@@ -95,10 +98,13 @@ export function toWikiCamel(name: string): string {
 /** Candidate absolute URLs for a wiki file name like `AstillaPrime.png`. */
 export function wikiFileUrls(fileName: string): string[] {
   const file = fileName.endsWith('.png') || fileName.endsWith('.PNG') ? fileName : `${fileName}.png`
+  // Non-ASCII wiki keys (RU display names) almost always 404 — skip them.
+  if (/[^\x00-\x7F]/.test(file)) return []
   const enc = encodeURIComponent(file)
   return [
-    `https://warframe.fandom.com/wiki/Special:FilePath/${enc}`,
+    // Official wiki CDN is more reliable through our img proxy than fandom Special:FilePath
     `https://wiki.warframe.com/images/${enc}`,
+    `https://warframe.fandom.com/wiki/Special:FilePath/${enc}`,
   ]
 }
 
@@ -106,6 +112,30 @@ export function wikiUrlForName(displayOrSlug: string): string[] {
   const camel = toWikiCamel(displayOrSlug.replace(/:/g, ' '))
   if (!camel) return []
   return wikiFileUrls(`${camel}.png`)
+}
+
+/** Void relic eras — all relics of a tier share one wiki icon. */
+export type RelicTier = 'Lith' | 'Meso' | 'Neo' | 'Axi' | 'Requiem'
+
+export function relicTierFromText(urlName?: string | null, name?: string | null): RelicTier | null {
+  const url = (urlName || '').toLowerCase()
+  const m = url.match(/^(lith|meso|neo|axi|requiem)(?:_|$)/)
+  if (m) {
+    const t = m[1]
+    return (t.charAt(0).toUpperCase() + t.slice(1)) as RelicTier
+  }
+  const n = (name || '').toLowerCase()
+  if (/requiem|реквием/.test(n)) return 'Requiem'
+  if (/\baxi\b|акси/.test(n)) return 'Axi'
+  if (/\bneo\b|нео/.test(n)) return 'Neo'
+  if (/\bmeso\b|мезо/.test(n)) return 'Meso'
+  if (/\blith\b|лит/.test(n)) return 'Lith'
+  return null
+}
+
+/** Shared Intact icon per tier (wiki Module:Void IMAGE_MAP). */
+export function relicTierImageUrls(tier: RelicTier): string[] {
+  return wikiFileUrls(`${tier}RelicIntact.png`)
 }
 
 export type PartVisual = {

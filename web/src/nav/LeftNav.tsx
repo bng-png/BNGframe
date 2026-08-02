@@ -11,6 +11,8 @@ export type NavId =
   | 'stats'
   | 'settings'
 
+export type MarketPresence = 'invisible' | 'online' | 'ingame'
+
 const NAV: { id: NavId; ico: string; labelKey: string }[] = [
   { id: 'mastery', ico: '◆', labelKey: 'nav_mastery' },
   { id: 'inventory', ico: '▣', labelKey: 'nav_inventory' },
@@ -22,6 +24,12 @@ const NAV: { id: NavId; ico: string; labelKey: string }[] = [
   { id: 'settings', ico: '⚙', labelKey: 'nav_settings' },
 ]
 
+function marketStatusLabel(t: (k: string) => string, status: MarketPresence) {
+  if (status === 'online') return t('market_online')
+  if (status === 'ingame') return t('market_ingame')
+  return t('market_offline')
+}
+
 export function LeftNav({
   active,
   onSelect,
@@ -29,6 +37,10 @@ export function LeftNav({
   profileName,
   mr,
   avatarUrl,
+  marketAuth,
+  marketStatus = 'invisible',
+  onCycleMarketStatus,
+  marketBusy,
 }: {
   active: NavId
   onSelect: (id: NavId) => void
@@ -36,10 +48,15 @@ export function LeftNav({
   profileName: string
   mr?: number | null
   avatarUrl?: string | null
+  marketAuth?: boolean
+  marketStatus?: MarketPresence
+  onCycleMarketStatus?: () => void
+  marketBusy?: boolean
 }) {
   const [imgFailed, setImgFailed] = useState(false)
   const cachedAvatar = cachedImgUrl(avatarUrl)
   const showImg = !!cachedAvatar && !imgFailed
+  const statusLabel = marketStatusLabel(t, marketStatus)
 
   return (
     <aside className="sidebar">
@@ -59,7 +76,21 @@ export function LeftNav({
           )}
         </div>
         <div className="profile-meta">
-          <div className="name">{profileName}</div>
+          <div className="name-row">
+            <div className="name">{profileName}</div>
+            {marketAuth ? (
+              <button
+                type="button"
+                className={`market-online-toggle ${marketStatus}`}
+                title={`${statusLabel} — ${t('market_status_cycle')}`}
+                aria-label={`${statusLabel}. ${t('market_status_cycle')}`}
+                disabled={marketBusy || !onCycleMarketStatus}
+                onClick={() => onCycleMarketStatus?.()}
+              >
+                <span className="dot" />
+              </button>
+            ) : null}
+          </div>
           <div className="mr">MR {mr ?? '—'}</div>
         </div>
       </div>

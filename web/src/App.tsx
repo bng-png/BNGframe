@@ -30,6 +30,9 @@ function AppInner() {
   const [orderType, setOrderType] = useState<'sell' | 'buy'>('sell')
   const [cacheAge, setCacheAge] = useState<string>('')
   const [profile, setProfile] = useState<PlayerProfile | null>(null)
+  const [marketAuth, setMarketAuth] = useState(false)
+  const [marketStatus, setMarketStatus] = useState<'invisible' | 'online' | 'ingame'>('invisible')
+  const [marketBusy, setMarketBusy] = useState(false)
 
   const run = useCallback(async (fn: () => Promise<unknown>) => {
     setBusy(true)
@@ -56,6 +59,35 @@ function AppInner() {
     }
   }, [])
 
+  const loadMarketAuth = useCallback(async () => {
+    try {
+      const a = await api.marketAuth()
+      setMarketAuth(!!a.authenticated)
+      const s = a.status
+      setMarketStatus(s === 'online' || s === 'ingame' ? s : 'invisible')
+    } catch {
+      setMarketAuth(false)
+      setMarketStatus('invisible')
+    }
+  }, [])
+
+  const cycleMarketStatus = useCallback(async () => {
+    setMarketBusy(true)
+    setErr('')
+    try {
+      const next =
+        marketStatus === 'invisible' ? 'online' : marketStatus === 'online' ? 'ingame' : 'invisible'
+      const a = await api.marketSetStatus(next)
+      setMarketAuth(!!a.authenticated)
+      const s = a.status
+      setMarketStatus(s === 'online' || s === 'ingame' ? s : 'invisible')
+    } catch (e: any) {
+      setErr(e.message || String(e))
+    } finally {
+      setMarketBusy(false)
+    }
+  }, [marketStatus])
+
   const loadInventory = useCallback(async () => {
     try {
       const meta = await api.inventoryCache()
@@ -79,6 +111,7 @@ function AppInner() {
     refreshStatus()
     loadInventory().catch(() => {})
     loadProfile().catch(() => {})
+    loadMarketAuth().catch(() => {})
     api.rewards().then(setRewards).catch(() => {})
     const ws = connectWs((ev) => {
       if (ev?.InventoryUpdated) loadInventory().catch(() => {})
@@ -94,7 +127,7 @@ function AppInner() {
       ws.close()
       clearInterval(id)
     }
-  }, [refreshStatus, loadInventory, loadProfile])
+  }, [refreshStatus, loadInventory, loadProfile, loadMarketAuth])
 
   const pick = (item: InventoryItem, ot: 'sell' | 'buy') => {
     setSelected(item)
@@ -119,6 +152,12 @@ function AppInner() {
         profileName={profile?.display_name || t('profile_placeholder')}
         mr={profile?.mastery_rank ?? null}
         avatarUrl={profile?.avatar_url}
+        marketAuth={marketAuth}
+        marketStatus={marketStatus}
+        marketBusy={marketBusy}
+        onCycleMarketStatus={() => {
+          void cycleMarketStatus()
+        }}
       />
       <div className="main">
         <header className="topbar">
@@ -181,12 +220,23 @@ function AppInner() {
               onItemPriced={onItemPriced}
               onWts={(i) => pick(i, 'sell')}
               onWtb={(i) => pick(i, 'buy')}
+              onSelectItem={(i) => pick(i, 'sell')}
             />
           )}
-          {tab === 'mastery' && <MasteryView t={t} />}
+          {tab === 'mastery' && (
+            <MasteryView t={t} onSelectItem={(i) => pick(i, 'sell')} />
+          )}
           {tab === 'relics' && <RelicsView t={t} />}
           {tab === 'rivens' && <RivensView t={t} />}
-          {tab === 'market' && <MarketView t={t} />}
+          {tab === 'market' && (
+            <MarketView
+              t={t}
+              onAuthChange={() => {
+                void loadMarketAuth()
+              }}
+              onSelectItem={(item) => pick(item, 'sell')}
+            />
+          )}
           {tab === 'analytics' && <AnalyticsView t={t} />}
           {tab === 'stats' && <StatsView t={t} />}
           {tab === 'settings' && (

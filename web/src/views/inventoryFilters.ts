@@ -43,6 +43,12 @@ export function filtersActive(f: InventoryFilters): boolean {
   )
 }
 
+export function isMasterySetComplete(set: MasterySet): boolean {
+  const parts = set.parts || []
+  if (!parts.length) return false
+  return parts.every((p) => (p.count || 0) > 0)
+}
+
 /** url_name → whether its parent set has every part owned (count > 0). */
 export function buildSetCompleteMap(sets: MasterySet[]): Map<string, boolean> {
   const map = new Map<string, boolean>()
@@ -53,6 +59,18 @@ export function buildSetCompleteMap(sets: MasterySet[]): Map<string, boolean> {
     if (s.url_name) map.set(s.url_name, complete)
     for (const p of parts) {
       if (p.url_name) map.set(p.url_name, complete)
+    }
+  }
+  return map
+}
+
+/** Part / set url_name → parent MasterySet. */
+export function buildUrlToSetMap(sets: MasterySet[]): Map<string, MasterySet> {
+  const map = new Map<string, MasterySet>()
+  for (const s of sets) {
+    if (s.url_name) map.set(s.url_name, s)
+    for (const p of s.parts || []) {
+      if (p.url_name) map.set(p.url_name, s)
     }
   }
   return map
@@ -104,4 +122,30 @@ export function togglePartKind(current: PartKind, next: 'normal' | 'prime'): Par
 
 export function toggleMinPlat(current: MinPlat, next: 5 | 10 | 15): MinPlat {
   return current === next ? null : next
+}
+
+/** Synthetic inventory row so RightRail can load WFM orders for a set/part. */
+export function normalizeMarketSlug(slug: string): string {
+  return slug.replace(/_helmet_blueprint$/i, '_neuroptics_blueprint')
+}
+
+export function masterySelectionToItem(opts: {
+  urlName: string
+  name: string
+  platinum?: number | null
+  thumb?: string | null
+  count?: number
+}): InventoryItem {
+  const urlName = normalizeMarketSlug(opts.urlName)
+  return {
+    unique_name: urlName,
+    name: opts.name,
+    count: opts.count ?? 1,
+    mastered: false,
+    item_type: 'part',
+    url_name: urlName,
+    platinum: opts.platinum ?? null,
+    thumb: opts.thumb ?? null,
+    favorite: false,
+  }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import { cachedImgUrls } from '../imgCache'
+import { cachedImgUrls, markImgFailed } from '../imgCache'
 
-/** Tries URLs in order (fandom → wiki fallback → optional extras). */
+/** Tries URLs in order (prefer callers put WFM thumb first). */
 export function WikiImg({
   urls,
   alt = '',
@@ -27,8 +27,12 @@ export function WikiImg({
       src={list[idx]}
       alt={alt}
       loading="lazy"
+      decoding="async"
       referrerPolicy={referrerPolicy}
-      onError={() => setIdx((i) => i + 1)}
+      onError={() => {
+        markImgFailed(list[idx])
+        setIdx((i) => i + 1)
+      }}
     />
   )
 }

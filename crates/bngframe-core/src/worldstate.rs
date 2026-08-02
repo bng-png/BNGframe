@@ -76,7 +76,11 @@ impl WorldStateService {
     }
 
     pub async fn snapshot(&self) -> Result<WorldStateSnapshot> {
-        {
+        self.snapshot_cached(false).await
+    }
+
+    pub async fn snapshot_cached(&self, force: bool) -> Result<WorldStateSnapshot> {
+        if !force {
             let guard = self.cache.lock().await;
             if let Some(c) = guard.as_ref() {
                 if c.at.elapsed() < Duration::from_secs(60) {
@@ -154,7 +158,8 @@ fn parse_worldstate(body: &Value) -> WorldStateSnapshot {
         }
     });
     let cambion = cycle_from("cambion", body.get("cambionCycle"), |v| {
-        v.get("active")
+        v.get("state")
+            .or_else(|| v.get("active"))
             .and_then(|x| x.as_str())
             .unwrap_or("unknown")
     });
@@ -222,7 +227,12 @@ fn parse_worldstate(body: &Value) -> WorldStateSnapshot {
                 eta: f
                     .get("eta")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        f.get("expiry")
+                            .and_then(|v| v.as_str())
+                            .and_then(format_remaining)
+                    }),
                 is_hard: f.get("isHard").and_then(|v| v.as_bool()).unwrap_or(false),
                 is_storm: f.get("isStorm").and_then(|v| v.as_bool()).unwrap_or(false),
             });
@@ -268,17 +278,46 @@ fn cycle_from(
     state_fn: impl Fn(&Value) -> &str,
 ) -> Option<CycleInfo> {
     let v = v?;
+    let expiry = v
+        .get("expiry")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let time_left = v
+        .get("timeLeft")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| expiry.as_deref().and_then(format_remaining));
     Some(CycleInfo {
         id: id.into(),
         state: state_fn(v).to_string(),
-        time_left: v
-            .get("timeLeft")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string()),
-        expiry: v
-            .get("expiry")
-            .and_then(|x| x.as_str())
-            .map(|s| s.to_string()),
+        time_left,
+        expiry,
+    })
+}
+
+fn format_remaining(expiry: &str) -> Option<String> {
+    let end = chrono::DateTime::parse_from_rfc3339(expiry)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            // warframestat sometimes emits `.000Z` / millis — chrono handles RFC3339
+            chrono::DateTime::parse_from_str(expiry, "%Y-%m-%dT%H:%M:%S%.fZ")
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        })?;
+    let secs = (end - chrono::Utc::now()).num_seconds();
+    if secs <= 0 {
+        return Some("0s".into());
+    }
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    Some(if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
     })
 }
 

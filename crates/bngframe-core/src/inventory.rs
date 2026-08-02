@@ -419,6 +419,13 @@ impl InventoryService {
                 "helminth_consumed_suits",
                 &serde_json::to_string(&consumed).unwrap_or_else(|_| "[]".into()),
             );
+            // Railjack / Drifter Intrinsics ranks (PlayerSkills LPS_*).
+            if let Some(skills) = body.get("PlayerSkills") {
+                let _ = db.set_setting(
+                    "player_skills",
+                    &serde_json::to_string(skills).unwrap_or_else(|_| "{}".into()),
+                );
+            }
             db.set_inventory_cache_meta(&synced_at, method, items.len(), account_id)?;
         }
 
@@ -760,6 +767,10 @@ pub fn parse_inventory_json(body: &Value) -> Vec<InventoryItem> {
         });
     }
 
+    // OperatorAmps / Hoverboards store affinity on the assembled item — credit the
+    // MR-granting ModularPart (amp prism / K-Drive deck) when XPInfo lacks a row.
+    apply_assembled_modular_xp(body, &mut out, &mut by_unique);
+
     // RawUpgrade / MiscItems / Recipes etc.
     for (key, type_label) in [
         ("RawUpgrades", "mod"),
@@ -836,6 +847,7 @@ fn count_owned_gear(body: &Value) -> std::collections::HashMap<String, i64> {
         "CatbrowPets",
         "Horses",
         "DataKnives",
+        "CrewShipHarnesses",
     ];
     let mut counts = std::collections::HashMap::new();
     for key in BINS {
@@ -851,6 +863,18 @@ fn count_owned_gear(body: &Value) -> std::collections::HashMap<String, i64> {
                 continue;
             }
             *counts.entry(unique.to_string()).or_insert(0) += 1;
+            // Amp prisms / K-Drive boards grant MR — count ModularParts too.
+            if matches!(*key, "OperatorAmps" | "Hoverboards") {
+                if let Some(parts) = entry.get("ModularParts").and_then(|v| v.as_array()) {
+                    for p in parts {
+                        let Some(pu) = p.as_str() else { continue };
+                        if pu.is_empty() {
+                            continue;
+                        }
+                        *counts.entry(pu.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
         }
     }
     counts
@@ -868,6 +892,9 @@ fn mastery_xp_threshold(unique: &str) -> i64 {
         || u.contains("moapet")
         || u.contains("/mechs/")
         || u.contains("entratimech")
+        || u.contains("hoverboard")
+        || u.contains("defaultharness")
+        || u.contains("crewship") && u.contains("harness")
     {
         900_000
     } else {
@@ -875,7 +902,64 @@ fn mastery_xp_threshold(unique: &str) -> i64 {
     }
 }
 
-/// Apply max `lvl` from `Upgrades` onto matching RawUpgrades rows (or create rows).
+/// Credit amp prism / K-Drive deck mastery from assembled gear XP in OperatorAmps / Hoverboards.
+fn apply_assembled_modular_xp(
+    body: &Value,
+    out: &mut Vec<InventoryItem>,
+    by_unique: &mut std::collections::HashMap<String, usize>,
+) {
+    for bin in ["OperatorAmps", "Hoverboards"] {
+        let Some(arr) = body.get(bin).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for amp in arr {
+            let xp = amp.get("XP").and_then(|v| v.as_i64()).unwrap_or(0);
+            if xp <= 0 {
+                continue;
+            }
+            let item_type = amp.get("ItemType").and_then(|v| v.as_str()).unwrap_or("");
+            let mut targets: Vec<String> = Vec::new();
+            if let Some(parts) = amp.get("ModularParts").and_then(|v| v.as_array()) {
+                for p in parts {
+                    let Some(pu) = p.as_str() else { continue };
+                    let l = pu.to_lowercase();
+                    // Amp prism (barrel) or K-Drive deck — the MR-granting part.
+                    if (l.contains("ampset") && l.contains("barrel"))
+                        || l.contains("sentamptrainingbarrel")
+                        || (l.contains("hoverboard") && l.contains("deck"))
+                    {
+                        targets.push(pu.to_string());
+                    }
+                }
+            }
+            let it_l = item_type.to_lowercase();
+            if it_l.contains("operatortrainingampweapon")
+                || it_l.contains("drifterpistol")
+                || (it_l.contains("hoverboard") && it_l.contains("deck"))
+            {
+                if !item_type.is_empty() {
+                    targets.push(item_type.to_string());
+                }
+            }
+            for t in targets {
+                let mastered = xp >= mastery_xp_threshold(&t);
+                if let Some(&idx) = by_unique.get(&t) {
+                    let row = &mut out[idx];
+                    if row.xp.unwrap_or(0) < xp {
+                        row.xp = Some(xp);
+                    }
+                    row.mastered = row.mastered || mastered;
+                }
+            }
+        }
+    }
+}
+
+/// Merge ranked/equipped copies from `Upgrades` into RawUpgrades rows.
+///
+/// DE keeps unranked stacks in `RawUpgrades` (ItemCount) and each ranked /
+/// installed copy as its own `Upgrades` entry with `UpgradeFingerprint.lvl`.
+/// Total owned = RawUpgrades count + Upgrades instances; UI rank = max lvl.
 fn merge_upgrade_ranks(body: &Value, out: &mut Vec<InventoryItem>) {
     let Some(arr) = body.get("Upgrades").and_then(|v| v.as_array()) else {
         return;
@@ -892,9 +976,8 @@ fn merge_upgrade_ranks(body: &Value, out: &mut Vec<InventoryItem>) {
         if unique.is_empty() {
             continue;
         }
-        let Some(lvl) = fingerprint_lvl(entry.get("UpgradeFingerprint")) else {
-            continue;
-        };
+        // Missing fingerprint ⇒ treat as rank 0 (still a distinct owned copy).
+        let lvl = fingerprint_lvl(entry.get("UpgradeFingerprint")).unwrap_or(0);
         let e = ranks.entry(unique.to_string()).or_insert((lvl, 0));
         e.0 = e.0.max(lvl);
         e.1 += 1;
@@ -907,6 +990,8 @@ fn merge_upgrade_ranks(body: &Value, out: &mut Vec<InventoryItem>) {
                 Some(r) => r.max(max_lvl),
                 None => max_lvl,
             });
+            // Ranked copies live only in Upgrades — add them to the unranked stack.
+            item.count = item.count.saturating_add(inst);
             continue;
         }
         // Equipped / ranked only — not present in RawUpgrades
@@ -997,6 +1082,25 @@ fn classify_unique(unique: &str) -> String {
             "blueprint".into()
         };
     }
+    if bare.contains("sentinelweapon")
+        || bare.contains("/sentinels/sentinelweapons/")
+        || bare.contains("moapetcomponents") && bare.contains("weapon")
+        || bare.contains("zanukapetmelee")
+    {
+        return classify_weapon_slot(bare).into();
+    }
+    if bare.contains("hoverboard") && bare.contains("deck") {
+        return "kdrive".into();
+    }
+    if bare.contains("defaultharness") {
+        return "plexus".into();
+    }
+    if bare.contains("operatoramplifiers")
+        || bare.contains("operatorampweapon")
+        || bare.contains("drifterpistol")
+    {
+        return "modular".into();
+    }
     if bare.contains("/weapons/")
         || bare.contains("/longguns/")
         || bare.contains("/pistols/")
@@ -1011,8 +1115,8 @@ fn classify_unique(unique: &str) -> String {
 }
 
 fn classify_weapon_slot(u: &str) -> &'static str {
-    if u.contains("operatoramplifiers") {
-        return "misc";
+    if u.contains("operatoramplifiers") || u.contains("drifterpistol") {
+        return "modular";
     }
     // Archwing gear is not primary/secondary/melee inventory tabs
     if u.contains("/archwing/") {
@@ -1060,11 +1164,12 @@ fn classify_weapon_slot(u: &str) -> &'static str {
 
 fn guess_url_name(unique: &str) -> Option<String> {
     let leaf = unique.rsplit('/').next()?;
+    let leaf = leaf.split('#').next().unwrap_or(leaf);
     let slug = normalize_name(&humanize_lotus_name(leaf)).replace(' ', "_");
     if slug.is_empty() {
         None
     } else {
-        Some(slug)
+        Some(crate::pricing::normalize_market_slug(&slug))
     }
 }
 

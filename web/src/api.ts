@@ -43,6 +43,8 @@ export type RewardSnapshot = {
 export type InventoryItem = {
   unique_name: string
   name: string
+  /** English name shown under localized title when different. */
+  name_en?: string | null
   count: number
   mastered: boolean
   item_type: string
@@ -114,6 +116,8 @@ export type SetPartProgress = {
   required?: number
   url_name?: string | null
   name?: string | null
+  /** WFM relative thumb path. */
+  thumb?: string | null
 }
 
 export type MasterySet = {
@@ -151,6 +155,12 @@ export type MarketOrder = {
   status?: string | null
   /** Mod / arcane rank (0–5 for mystics). */
   rank?: number | null
+  item_name?: string | null
+  /** English catalog name (secondary label). */
+  item_name_en?: string | null
+  thumb?: string | null
+  /** Relic quality: intact / exceptional / flawless / radiant. */
+  subtype?: string | null
 }
 
 export type PlayerProfile = {
@@ -182,16 +192,33 @@ export const api = {
   planner: () => req<any>('/api/relics/planner'),
   setPlanner: (body: any) =>
     req('/api/relics/planner', { method: 'POST', body: JSON.stringify(body) }),
-  marketOrders: () => req<MarketOrder[]>('/api/market/orders'),
+  marketOrders: (opts?: { refresh?: boolean }) =>
+    req<MarketOrder[]>(
+      opts?.refresh ? '/api/market/orders?refresh=true' : '/api/market/orders',
+    ),
   marketItemOrders: (urlName: string) =>
     req<MarketOrder[]>(`/api/market/orders/item/${encodeURIComponent(urlName)}`),
   marketSignIn: (email: string, password: string) =>
     req('/api/market/signin', { method: 'POST', body: JSON.stringify({ email, password }) }),
   marketJwt: (jwt: string) =>
     req('/api/market/jwt', { method: 'POST', body: JSON.stringify({ jwt }) }),
+  marketAuth: () =>
+    req<{ authenticated: boolean; status?: string | null }>('/api/market/auth'),
+  marketSetStatus: (status: 'online' | 'ingame' | 'invisible') =>
+    req<{ authenticated: boolean; status?: string | null }>('/api/market/status', {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
   marketSuggestions: () => req<any[]>('/api/market/suggestions'),
   createOrder: (body: any) =>
     req('/api/market/orders/create', { method: 'POST', body: JSON.stringify(body) }),
+  deleteOrder: (orderId: string) =>
+    req(`/api/market/orders/${encodeURIComponent(orderId)}`, { method: 'DELETE' }),
+  closeOrder: (orderId: string, quantity?: number) =>
+    req(`/api/market/orders/${encodeURIComponent(orderId)}/close`, {
+      method: 'POST',
+      body: JSON.stringify({ quantity: quantity ?? null }),
+    }),
   analyzeRiven: (text: string) =>
     req('/api/rivens/analyze', { method: 'POST', body: JSON.stringify({ text }) }),
   compareRivens: (old_text: string, new_text: string) =>
@@ -209,8 +236,39 @@ export const api = {
     req<{ url_name: string; platinum: number; volume: number; updated_at: string }>(
       `/api/prices/item/${encodeURIComponent(urlName)}`,
     ),
-  worldstate: () => req<WorldStateSnapshot>('/api/worldstate'),
+  worldstate: (opts?: { refresh?: boolean }) =>
+    req<WorldStateSnapshot>(
+      opts?.refresh ? '/api/worldstate?refresh=true' : '/api/worldstate',
+    ),
   masterySets: () => req<{ sets: MasterySet[] }>('/api/mastery/sets'),
+}
+
+/** Fired after create / close / delete so MarketView can soft-refresh without a manual button. */
+export const MARKET_ORDERS_CHANGED = 'bngframe:market-orders-changed'
+const MY_ORDERS_LS_KEY = 'bngframe.my_orders.v1'
+
+export function notifyMarketOrdersChanged() {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new Event(MARKET_ORDERS_CHANGED))
+}
+
+export function readCachedMyOrders(): MarketOrder[] | null {
+  try {
+    const raw = sessionStorage.getItem(MY_ORDERS_LS_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as MarketOrder[]) : null
+  } catch {
+    return null
+  }
+}
+
+export function writeCachedMyOrders(orders: MarketOrder[]) {
+  try {
+    sessionStorage.setItem(MY_ORDERS_LS_KEY, JSON.stringify(orders))
+  } catch {
+    /* quota / private mode */
+  }
 }
 
 export function connectWs(onEvent: (ev: any) => void) {

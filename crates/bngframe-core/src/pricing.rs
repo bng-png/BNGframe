@@ -277,6 +277,7 @@ impl PricingService {
         let _ = self.refresh_lotus_flavour_names().await;
         let _ = self.refresh_lotus_extra_ru_names().await;
         let _ = self.refresh_craft_gear_recipes().await;
+        let _ = self.refresh_craft_part_qty().await;
         let db = self.db.lock().await;
         db.lotus_name_map_all()
     }
@@ -450,13 +451,19 @@ impl PricingService {
     }
 
     /// Cache blueprint → gear ingredients (e.g. Akbronco needs 2× Bronco Prime).
+    /// Versioned so Lotus dual_* / Boltonfa keys get remapped to public set_keys.
     pub async fn refresh_craft_gear_recipes(&self) -> Result<usize> {
         {
             let db = self.db.lock().await;
-            if let Ok(Some(raw)) = db.get_setting("craft_gear_recipes") {
-                if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<CraftGearIng>>>(&raw) {
-                    if map.len() >= 10 {
-                        return Ok(map.len());
+            let ver = db.get_setting("craft_gear_recipes_ver").ok().flatten();
+            if ver.as_deref() == Some(CRAFT_GEAR_RECIPES_VER) {
+                if let Ok(Some(raw)) = db.get_setting("craft_gear_recipes") {
+                    if let Ok(map) =
+                        serde_json::from_str::<HashMap<String, Vec<CraftGearIng>>>(&raw)
+                    {
+                        if map.len() >= 10 {
+                            return Ok(map.len());
+                        }
                     }
                 }
             }
@@ -466,6 +473,10 @@ impl PricingService {
             .fetch_de_export_json("ExportRecipes_en.json")
             .await
             .context("ExportRecipes_en")?;
+        let weapons_en = self
+            .fetch_export_weapons_en_names()
+            .await
+            .unwrap_or_default();
         let arr = v
             .get("ExportRecipes")
             .and_then(|x| x.as_array())
@@ -479,7 +490,11 @@ impl PricingService {
             if unique.is_empty() {
                 continue;
             }
-            let Some(set_key) = set_key_from_blueprint_unique(unique) else {
+            let result = recipe
+                .get("resultType")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let Some(set_key) = craft_set_key_for_recipe(unique, result, &weapons_en) else {
                 continue;
             };
             let Some(ings) = recipe.get("ingredients").and_then(|x| x.as_array()) else {
@@ -526,6 +541,7 @@ impl PricingService {
         {
             let db = self.db.lock().await;
             db.set_setting("craft_gear_recipes", &raw)?;
+            db.set_setting("craft_gear_recipes_ver", CRAFT_GEAR_RECIPES_VER)?;
         }
         info!("Cached craft gear recipes for {n} sets");
         Ok(n)
@@ -535,10 +551,15 @@ impl PricingService {
     pub async fn craft_gear_map(&self) -> HashMap<String, Vec<CraftGearIng>> {
         {
             let db = self.db.lock().await;
-            if let Ok(Some(raw)) = db.get_setting("craft_gear_recipes") {
-                if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<CraftGearIng>>>(&raw) {
-                    if !map.is_empty() {
-                        return map;
+            let ver = db.get_setting("craft_gear_recipes_ver").ok().flatten();
+            if ver.as_deref() == Some(CRAFT_GEAR_RECIPES_VER) {
+                if let Ok(Some(raw)) = db.get_setting("craft_gear_recipes") {
+                    if let Ok(map) =
+                        serde_json::from_str::<HashMap<String, Vec<CraftGearIng>>>(&raw)
+                    {
+                        if !map.is_empty() {
+                            return remap_craft_gear_map(map);
+                        }
                     }
                 }
             }
@@ -549,7 +570,155 @@ impl PricingService {
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
+            .map(remap_craft_gear_map)
             .unwrap_or_default()
+    }
+
+    /// Cache set_key → craft part role quantities from DE ExportRecipes (blade×2, …).
+    pub async fn refresh_craft_part_qty(&self) -> Result<usize> {
+        {
+            let db = self.db.lock().await;
+            let ver = db.get_setting("craft_part_qty_ver").ok().flatten();
+            if ver.as_deref() == Some(CRAFT_PART_QTY_VER) {
+                if let Ok(Some(raw)) = db.get_setting("craft_part_qty") {
+                    if let Ok(map) =
+                        serde_json::from_str::<HashMap<String, HashMap<String, i64>>>(&raw)
+                    {
+                        if map.len() >= 20 {
+                            return Ok(map.len());
+                        }
+                    }
+                }
+            }
+        }
+        info!("Fetching DE ExportRecipes for craft part quantities…");
+        let v = self
+            .fetch_de_export_json("ExportRecipes_en.json")
+            .await
+            .context("ExportRecipes_en")?;
+        let weapons_en = self
+            .fetch_export_weapons_en_names()
+            .await
+            .unwrap_or_default();
+        let arr = v
+            .get("ExportRecipes")
+            .and_then(|x| x.as_array())
+            .context("ExportRecipes array")?;
+        let mut map: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for recipe in arr {
+            let unique = recipe
+                .get("uniqueName")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let result = recipe
+                .get("resultType")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if unique.is_empty() || result.is_empty() {
+                continue;
+            }
+            // Only finished weapons (not component BPs / resources).
+            if !weapons_en.contains_key(result) {
+                continue;
+            }
+            if is_component_blueprint_leaf(unique) {
+                continue;
+            }
+            let Some(set_key) = craft_set_key_for_recipe(unique, result, &weapons_en) else {
+                continue;
+            };
+            let Some(ings) = recipe.get("ingredients").and_then(|x| x.as_array()) else {
+                continue;
+            };
+            let mut roles: HashMap<String, i64> = HashMap::new();
+            for ing in ings {
+                let item = ing
+                    .get("ItemType")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let Some(role) = craft_part_role_from_unique(item) else {
+                    continue;
+                };
+                let n = ing
+                    .get("ItemCount")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(1)
+                    .max(1);
+                *roles.entry(role.to_string()).or_insert(0) += n;
+            }
+            if roles.is_empty() {
+                continue;
+            }
+            // Skip modular / Incarnon junk (blade×10 etc.)
+            if roles.values().any(|n| *n > 4) {
+                continue;
+            }
+            let slot = map.entry(set_key).or_default();
+            for (role, n) in roles {
+                let e = slot.entry(role).or_insert(0);
+                *e = (*e).max(n);
+            }
+        }
+        let n = map.len();
+        let raw = serde_json::to_string(&map)?;
+        {
+            let db = self.db.lock().await;
+            db.set_setting("craft_part_qty", &raw)?;
+            db.set_setting("craft_part_qty_ver", CRAFT_PART_QTY_VER)?;
+        }
+        info!("Cached craft part quantities for {n} sets");
+        Ok(n)
+    }
+
+    /// set_key → role → required count (from DE foundry recipes).
+    pub async fn craft_part_qty_map(&self) -> HashMap<String, HashMap<String, i64>> {
+        {
+            let db = self.db.lock().await;
+            let ver = db.get_setting("craft_part_qty_ver").ok().flatten();
+            if ver.as_deref() == Some(CRAFT_PART_QTY_VER) {
+                if let Ok(Some(raw)) = db.get_setting("craft_part_qty") {
+                    if let Ok(map) =
+                        serde_json::from_str::<HashMap<String, HashMap<String, i64>>>(&raw)
+                    {
+                        if !map.is_empty() {
+                            return map;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = self.refresh_craft_part_qty().await;
+        let db = self.db.lock().await;
+        db.get_setting("craft_part_qty")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    async fn fetch_export_weapons_en_names(&self) -> Result<HashMap<String, String>> {
+        let v = self
+            .fetch_de_export_json("ExportWeapons_en.json")
+            .await
+            .context("ExportWeapons_en")?;
+        let arr = v
+            .get("ExportWeapons")
+            .and_then(|x| x.as_array())
+            .context("ExportWeapons array")?;
+        let mut out = HashMap::new();
+        for w in arr {
+            let Some(u) = w.get("uniqueName").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(n) = w.get("name").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let cleaned = strip_export_tags(n);
+            if !cleaned.is_empty() {
+                out.insert(u.to_string(), cleaned);
+            }
+        }
+        Ok(out)
     }
 
     async fn fetch_de_export_json(&self, index_entry_prefix: &str) -> Result<Value> {
@@ -738,8 +907,10 @@ impl PricingService {
         lotus_names: &HashMap<String, String>,
     ) -> Option<ItemRow> {
         if let Some(ref url) = inv.url_name {
-            if let Some(item) = by_norm.get(url) {
-                return Some(item.clone());
+            for cand in market_slug_candidates(url) {
+                if let Some(item) = by_norm.get(&cand) {
+                    return Some(item.clone());
+                }
             }
         }
         if let Some(item) = Self::resolve_market_item_indexed(&inv.name, by_norm) {
@@ -758,12 +929,36 @@ impl PricingService {
             }
             // Arcanes sometimes listed without "Arcane " prefix mismatches — try slug
             let slug = normalize_name(en).replace(' ', "_");
-            if let Some(item) = by_norm.get(&slug) {
-                return Some(item.clone());
+            for cand in market_slug_candidates(&slug) {
+                if let Some(item) = by_norm.get(&cand) {
+                    return Some(item.clone());
+                }
             }
         }
-        // Relic path without WFCD cache yet: guess lith_*_relic from leaf is hopeless;
-        // void projections need the Relics.json map.
+        // DE HelmetBlueprint → market neuroptics_blueprint via leaf aliases
+        let leaf = inv
+            .unique_name
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("");
+        if !leaf.is_empty() {
+            for alias in reward_leaf_aliases(leaf) {
+                let slug = lotus_to_slug(&alias);
+                for cand in market_slug_candidates(&slug) {
+                    if let Some(item) = by_norm.get(&cand) {
+                        return Some(item.clone());
+                    }
+                    if !cand.ends_with("_blueprint") {
+                        if let Some(item) = by_norm.get(&format!("{cand}_blueprint")) {
+                            return Some(item.clone());
+                        }
+                    }
+                }
+            }
+        }
         None
     }
 
@@ -953,7 +1148,7 @@ impl PricingService {
     }
 
     /// Live WFM quote: average of the `n` cheapest visible sell orders
-    /// from ingame/online sellers (falls back to all visible sells if needed).
+    /// (ingame first, then online, then any visible).
     pub async fn price_for(&self, url_name: &str) -> Result<PriceCache> {
         self.price_for_inner(url_name, false).await
     }
@@ -1240,6 +1435,63 @@ impl PricingService {
             catalog_size: result.catalog_size,
         })
     }
+
+    /// Refresh order-book quotes for all prime parts / sets that are missing or
+    /// older than [`crate::db::PRICE_FRESH_MINS`]. Used on daemon startup so OCR
+    /// can read plat from cache without a live WFM call mid-reward.
+    pub async fn refresh_prime_part_prices(&self) -> Result<PriceRefreshResult> {
+        let _ = self.ensure_items_cached().await?;
+        let catalog = {
+            let db = self.db.lock().await;
+            db.all_items()?
+        };
+        let mut targets: Vec<String> = catalog
+            .iter()
+            .filter(|i| is_prime_market_slug(&i.url_name))
+            .map(|i| i.url_name.clone())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        let catalog_size = catalog.len();
+        let matched = targets.len();
+
+        let mut to_fetch = Vec::new();
+        {
+            let db = self.db.lock().await;
+            for url in targets {
+                // Skip still-fresh quotes — restart within the hour stays fast.
+                if db.get_price(&url)?.is_none() {
+                    to_fetch.push(url);
+                }
+            }
+        }
+
+        info!(
+            "Prime-part price refresh: {} stale/missing of {matched} prime slugs",
+            to_fetch.len()
+        );
+        let mut priced = 0usize;
+        let mut failed = 0usize;
+        for url in &to_fetch {
+            match self.price_for_refresh(url).await {
+                Ok(p) if p.platinum > 0.0 => priced += 1,
+                Ok(_) => {}
+                Err(_) => failed += 1,
+            }
+        }
+        Ok(PriceRefreshResult {
+            matched,
+            priced,
+            failed,
+            catalog_size,
+        })
+    }
+}
+
+/// Tradable prime listing on WFM (`*_prime_*` parts/BPs or `*_prime_set`).
+fn is_prime_market_slug(url_name: &str) -> bool {
+    let u = url_name.to_ascii_lowercase();
+    u.contains("_prime_") || u.ends_with("_prime_set")
 }
 
 /// Inventory stores `…#RawUpgrades` / `…#MiscItems` suffixes; WFCD uses bare Lotus paths.
@@ -1511,9 +1763,9 @@ pub fn normalize_name(s: &str) -> String {
 }
 
 /// Average platinum of the `n` cheapest visible sell orders.
-/// Prefers ingame/online sellers; if fewer than `n`, falls back to all visible sells.
+/// Priority: ingame sellers → online sellers → any visible sell.
 pub fn avg_cheapest_sells(orders: &[serde_json::Value], n: usize) -> (f64, i64) {
-    let sell_plat = |prefer_online: bool| -> Vec<f64> {
+    let sell_plat = |status_filter: Option<&[&str]>| -> Vec<f64> {
         let mut sells: Vec<f64> = orders
             .iter()
             .filter(|o| {
@@ -1525,13 +1777,11 @@ pub fn avg_cheapest_sells(orders: &[serde_json::Value], n: usize) -> (f64, i64) 
             })
             .filter(|o| o.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
             .filter(|o| {
-                if !prefer_online {
+                let Some(allowed) = status_filter else {
                     return true;
-                }
-                matches!(
-                    o.pointer("/user/status").and_then(|v| v.as_str()),
-                    Some("ingame") | Some("online")
-                )
+                };
+                let status = o.pointer("/user/status").and_then(|v| v.as_str());
+                allowed.iter().any(|s| status == Some(*s))
             })
             .filter_map(|o| o.get("platinum").and_then(|v| v.as_f64()))
             .filter(|p| *p > 0.0)
@@ -1540,9 +1790,13 @@ pub fn avg_cheapest_sells(orders: &[serde_json::Value], n: usize) -> (f64, i64) 
         sells
     };
 
-    let mut sells = sell_plat(true);
-    if sells.len() < n {
-        sells = sell_plat(false);
+    // Prefer in-game sellers; only if none, fall back to website-online, then anyone.
+    let mut sells = sell_plat(Some(&["ingame"]));
+    if sells.is_empty() {
+        sells = sell_plat(Some(&["online"]));
+    }
+    if sells.is_empty() {
+        sells = sell_plat(None);
     }
     let volume = sells.len() as i64;
     if sells.is_empty() || n == 0 {
@@ -1822,6 +2076,23 @@ fn lotus_to_slug(name: &str) -> String {
     normalize_name(&humanize_lotus_name(name)).replace(' ', "_")
 }
 
+/// DE recipe paths use `Helmet`; warframe.market uses `neuroptics`.
+pub fn normalize_market_slug(slug: &str) -> String {
+    if let Some(rest) = slug.strip_suffix("_helmet_blueprint") {
+        return format!("{rest}_neuroptics_blueprint");
+    }
+    slug.to_string()
+}
+
+fn market_slug_candidates(slug: &str) -> Vec<String> {
+    let mut out = vec![slug.to_string()];
+    let norm = normalize_market_slug(slug);
+    if norm != slug {
+        out.push(norm);
+    }
+    out
+}
+
 fn tradable_priority_slug(slug: &str) -> i32 {
     let mut s = 0;
     if slug.contains("prime") {
@@ -1874,6 +2145,13 @@ const PART_SET_SUFFIXES: &[&str] = &[
     "_cerebrum",
     "_harness",
     "_wings",
+    "_engines",
+    "_fuselage",
+    "_avionics",
+    "_casing",
+    "_capsule",
+    "_weapon_pod",
+    "_engine",
 ];
 
 /// Map a part or WFM pseudo-set slug to the parent tradeable set (`atlas_prime_set`).
@@ -1974,6 +2252,163 @@ fn set_key_from_blueprint_unique(unique: &str) -> Option<String> {
     }
 }
 
+const CRAFT_GEAR_RECIPES_VER: &str = "3";
+const CRAFT_PART_QTY_VER: &str = "1";
+
+fn craft_set_key_for_recipe(
+    blueprint_unique: &str,
+    result_unique: &str,
+    weapons_en: &HashMap<String, String>,
+) -> Option<String> {
+    let from_en = weapons_en
+        .get(result_unique)
+        .and_then(|en| en_weapon_name_to_set_key(en));
+    let from_bp = set_key_from_blueprint_unique(blueprint_unique);
+    let key = from_en.or(from_bp)?;
+    Some(canonicalize_craft_set_key(&key))
+}
+
+fn en_weapon_name_to_set_key(en: &str) -> Option<String> {
+    let cleaned = strip_export_tags(en);
+    if cleaned.is_empty() {
+        return None;
+    }
+    let key = normalize_name(&cleaned).replace(' ', "_");
+    (!key.is_empty()).then_some(key)
+}
+
+fn is_component_blueprint_leaf(unique: &str) -> bool {
+    let leaf = unique.rsplit('/').next().unwrap_or(unique);
+    [
+        "Barrel",
+        "Receiver",
+        "Reciever",
+        "Stock",
+        "Blade",
+        "Handle",
+        "Link",
+        "Grip",
+        "String",
+        "Chain",
+        "Ornament",
+        "Gauntlet",
+        "Hilt",
+        "Guard",
+        "Helmet",
+        "Chassis",
+        "Systems",
+        "Neuroptics",
+        "Harness",
+        "Wings",
+        "Carapace",
+        "Cerebrum",
+        "Pouch",
+        "Head",
+    ]
+    .iter()
+    .any(|s| leaf.contains(s) && leaf.ends_with("Blueprint"))
+}
+
+fn craft_part_role_from_unique(unique: &str) -> Option<&'static str> {
+    let leaf = unique.rsplit('/').next().unwrap_or(unique).to_lowercase();
+    const SUFFIXES: &[(&str, &str)] = &[
+        ("neuroptics", "neuroptics"),
+        ("chassis", "chassis"),
+        ("systems", "systems"),
+        ("barrel", "barrel"),
+        ("receiver", "receiver"),
+        ("reciever", "receiver"),
+        ("stock", "stock"),
+        ("link", "link"),
+        ("blade", "blade"),
+        ("handle", "handle"),
+        ("gauntlet", "gauntlet"),
+        ("grip", "grip"),
+        ("string", "string"),
+        ("chain", "chain"),
+        ("ornament", "ornament"),
+        ("hilt", "hilt"),
+        ("guard", "guard"),
+        ("pouch", "pouch"),
+        ("harness", "harness"),
+        ("wings", "wings"),
+        ("carapace", "carapace"),
+        ("cerebrum", "cerebrum"),
+        ("lowerlimb", "lower_limb"),
+        ("upperlimb", "upper_limb"),
+        ("head", "head"),
+    ];
+    for (suf, role) in SUFFIXES {
+        if leaf.ends_with(suf) {
+            return Some(*role);
+        }
+    }
+    None
+}
+
+/// Lotus dual/akimbo / internal recipe leaves → public mastery set_key.
+fn canonicalize_craft_set_key(key: &str) -> String {
+    match key {
+        "dual_broncos" => "akbronco".into(),
+        "dual_vastos" => "akvasto".into(),
+        "ak_bolto" => "akbolto".into(),
+        "dual_magnus" => "akmagnus".into(),
+        "a_furis" => "afuris".into(),
+        "boltonfa" => "boltace".into(),
+        "twin_viper" => "twin_vipers".into(),
+        "tenno_gunblade" => "redeemer".into(),
+        "tno_gunblade_automatic" => "sarpa".into(),
+        "tno_miter" => "panthera".into(),
+        "tno_monk_staff" => "tipedo".into(),
+        "tno_bladed_pistols" => "akjagara".into(),
+        "tno_nunchaku" => "shaku".into(),
+        "inf_tipedo" => "lesion".into(),
+        "inf_cernos" => "mutalist_cernos".into(),
+        "derelict_cernos" => "proboscis_cernos".into(),
+        "ceph_hammer" => "heliocor".into(),
+        "convert_katana" => "dragon_nikana".into(),
+        "grn_claws" => "ripkas".into(),
+        "grn_dual_fire_axe" => "twin_basolk".into(),
+        "grn_cannon_weapon" => "zarr".into(),
+        "grn_torpedo_pistol" => "kulstar".into(),
+        "grn_trident_weapon" => "sydon".into(),
+        "grn_arch_hand" => "knux".into(),
+        "ice_hammer" => "sibear".into(),
+        "drake_rifle" => "tiberon".into(),
+        "single_staff" => "cadus".into(),
+        "infested_kogake" => "hirudo".into(),
+        "quill_dartgun" => "hystrix".into(),
+        "stalker_two_greatsword" => "war".into(),
+        "ballas_sword" => "paracesis".into(),
+        "dark_sword_dagger_hybrid" => "dark_split_sword".into(),
+        "dual_corpus_minigun" => "dual_cestra".into(),
+        "dual_grn_egypt_swd" => "twin_krohkur".into(),
+        "brawler_knuckles" => "tekko".into(),
+        other => other.to_string(),
+    }
+}
+
+fn remap_craft_gear_map(
+    map: HashMap<String, Vec<CraftGearIng>>,
+) -> HashMap<String, Vec<CraftGearIng>> {
+    let mut out: HashMap<String, Vec<CraftGearIng>> = HashMap::new();
+    for (key, ings) in map {
+        let nk = canonicalize_craft_set_key(&key);
+        let slot = out.entry(nk).or_default();
+        for ing in ings {
+            if let Some(existing) = slot.iter_mut().find(|e| e.unique == ing.unique) {
+                existing.count = existing.count.max(ing.count);
+            } else {
+                slot.push(ing);
+            }
+        }
+    }
+    for list in out.values_mut() {
+        list.sort_by(|a, b| a.unique.cmp(&b.unique));
+    }
+    out
+}
+
 fn pascal_case_to_set_key(name: &str) -> String {
     let mut out = String::new();
     for (i, c) in name.chars().enumerate() {
@@ -2067,9 +2502,24 @@ mod set_slug_tests {
         ]);
         let arr = orders.as_array().unwrap();
         let (plat, vol) = avg_cheapest_sells(arr, 3);
-        assert_eq!(vol, 4);
-        // (10+14+20)/3 = 14.666... → 14.7
-        assert!((plat - 14.7).abs() < 0.01, "plat={plat}");
+        // Only ingame sells: 10, 20, 100 → volume 3; avg (10+20+100)/3 = 43.3
+        assert_eq!(vol, 3);
+        assert!((plat - 43.3).abs() < 0.01, "plat={plat}");
+    }
+
+    #[test]
+    fn avg_cheapest_sells_falls_back_to_online_when_no_ingame() {
+        let orders = serde_json::json!([
+            {"type":"sell","visible":true,"platinum":14,"user":{"status":"online"}},
+            {"type":"sell","visible":true,"platinum":18,"user":{"status":"online"}},
+            {"type":"sell","visible":true,"platinum":50,"user":{"status":"online"}},
+            {"type":"sell","visible":true,"platinum":2,"user":{"status":"offline"}},
+        ]);
+        let arr = orders.as_array().unwrap();
+        let (plat, vol) = avg_cheapest_sells(arr, 3);
+        assert_eq!(vol, 3);
+        // (14+18+50)/3 = 27.333… → 27.3
+        assert!((plat - 27.3).abs() < 0.01, "plat={plat}");
     }
 
 
@@ -2116,4 +2566,48 @@ mod set_slug_tests {
             Some("paris_prime_blueprint")
         );
     }
+}
+
+#[cfg(test)]
+mod inv_resolve_tests {
+    use super::*;
+    use crate::db::InventoryItem;
+
+    #[test]
+    fn helmet_url_resolves_via_slug_candidates() {
+        let catalog = vec![ItemRow {
+            url_name: "sevagoth_prime_neuroptics_blueprint".into(),
+            name: "Sevagoth Prime Neuroptics Blueprint".into(),
+            name_ru: Some("Севагот Прайм: Нейрооптика (Чертеж)".into()),
+            thumb: None,
+            ducats: Some(15),
+            set_url_name: Some("sevagoth_prime_set".into()),
+            vaulted: None,
+            mastery: None,
+        }];
+        let by_norm = PricingService::build_catalog_index(&catalog);
+        let inv = InventoryItem {
+            unique_name: "/Lotus/Types/Recipes/WarframeRecipes/SevagothPrimeHelmetBlueprint#Recipes".into(),
+            name: "Sevagoth Prime Helmet Blueprint".into(),
+            count: 1,
+            xp: None,
+            mastered: false,
+            item_type: "blueprint".into(),
+            url_name: Some("sevagoth_prime_helmet_blueprint".into()),
+            platinum: None,
+            ducats: None,
+            favorite: false,
+            thumb: None,
+            vaulted: None,
+            rank: None,
+        };
+        let hit = PricingService::resolve_inventory_market_item(&inv, &by_norm, &Default::default());
+        assert_eq!(
+            hit.as_ref().map(|i| i.url_name.as_str()),
+            Some("sevagoth_prime_neuroptics_blueprint"),
+            "got {:?}",
+            hit.as_ref().map(|i| i.url_name.clone())
+        );
+    }
+
 }

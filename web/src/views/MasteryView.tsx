@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, type MasterySet } from '../api'
+import { api, type InventoryItem, type MasterySet } from '../api'
 import { SetCard } from '../components/SetCard'
+import { useWarmVisiblePrices } from '../hooks/useWarmVisiblePrices'
+import { masterySelectionToItem } from './inventoryFilters'
 
 const MASTERY_TYPES = [
   'warframe',
@@ -9,7 +11,11 @@ const MASTERY_TYPES = [
   'melee',
   'companion',
   'archwing',
+  'necramech',
   'modular',
+  'kdrive',
+  'plexus',
+  'intrinsic',
 ] as const
 
 type MasteryType = (typeof MASTERY_TYPES)[number]
@@ -21,7 +27,11 @@ const TYPE_I18N: Record<MasteryType, string> = {
   melee: 'cat_melee',
   companion: 'cat_companion',
   archwing: 'cat_archwing',
+  necramech: 'cat_necramech',
   modular: 'cat_modular',
+  kdrive: 'cat_kdrive',
+  plexus: 'cat_plexus',
+  intrinsic: 'cat_intrinsic',
 }
 
 function normalizeCategory(cat: string): MasteryType | null {
@@ -30,55 +40,34 @@ function normalizeCategory(cat: string): MasteryType | null {
   return null
 }
 
-export function MasteryView({ t }: { t: (k: string) => string }) {
+export function MasteryView({
+  t,
+  onSelectItem,
+}: {
+  t: (k: string) => string
+  onSelectItem?: (item: InventoryItem) => void
+}) {
   const [sets, setSets] = useState<MasterySet[]>([])
   const [err, setErr] = useState('')
+  const [loading, setLoading] = useState(true)
   const [q, setQ] = useState('')
   const [typeFilter, setTypeFilter] = useState<MasteryType | null>(null)
   const [onlyIncomplete, setOnlyIncomplete] = useState(false)
-  const [pricing, setPricing] = useState<{ done: number; total: number } | null>(null)
 
   useEffect(() => {
     let cancelled = false
     setErr('')
-    setPricing(null)
+    setLoading(true)
 
     ;(async () => {
       try {
         const r = await api.masterySets()
         if (cancelled) return
-        const list = r.sets || []
-        setSets(list)
-
-        const targets = list
-          .map((s) => s.url_name)
-          .filter((u): u is string => !!u && u.endsWith('_set'))
-        // unique preserve order
-        const seen = new Set<string>()
-        const urls = targets.filter((u) => (seen.has(u) ? false : (seen.add(u), true)))
-
-        if (!urls.length) return
-        setPricing({ done: 0, total: urls.length })
-
-        for (let i = 0; i < urls.length; i++) {
-          if (cancelled) return
-          const url = urls[i]
-          try {
-            const p = await api.priceItem(url)
-            if (cancelled) return
-            if (p.platinum > 0) {
-              setSets((prev) =>
-                prev.map((s) => (s.url_name === url ? { ...s, platinum: p.platinum } : s)),
-              )
-            }
-          } catch {
-            /* ignore single failures */
-          }
-          if (!cancelled) setPricing({ done: i + 1, total: urls.length })
-        }
-        if (!cancelled) setPricing(null)
+        setSets(r.sets || [])
       } catch (e: any) {
         if (!cancelled) setErr(e.message || String(e))
+      } finally {
+        if (!cancelled) setLoading(false)
       }
     })()
 
@@ -119,71 +108,124 @@ export function MasteryView({ t }: { t: (k: string) => string }) {
     return list
   }, [sets, q, onlyIncomplete, typeFilter])
 
+  // Only warm missing prices for currently visible cards (API already fills cached plat).
+  const visibleUrls = useMemo(
+    () =>
+      filtered
+        .slice(0, 60)
+        .map((s) => s.url_name)
+        .filter((u): u is string => !!u && u.endsWith('_set')),
+    [filtered],
+  )
+  const pricing = useWarmVisiblePrices(
+    visibleUrls,
+    (url) => sets.some((s) => s.url_name === url && (s.platinum ?? 0) > 0),
+    (url, platinum) => {
+      setSets((prev) => prev.map((s) => (s.url_name === url ? { ...s, platinum } : s)))
+    },
+  )
+
   return (
-    <>
-      <div className="toolbar">
-        <input
-          className="search"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder={t('filter_placeholder')}
-        />
-        <label className="chip">
+    <div className="mastery-layout">
+      <div className="mastery-toolbar">
+        <div className="toolbar">
           <input
-            type="checkbox"
-            checked={onlyIncomplete}
-            onChange={(e) => setOnlyIncomplete(e.target.checked)}
-          />{' '}
-          {t('incomplete_sets')}
-        </label>
-        {pricing && (
-          <span className="muted" style={{ fontSize: '0.9rem' }}>
-            {t('loading_prices')} {pricing.done}/{pricing.total}
-          </span>
-        )}
-      </div>
-      <div className="chips" style={{ marginBottom: 16 }}>
-        <button
-          type="button"
-          className={`chip${typeFilter == null ? ' active' : ''}`}
-          onClick={() => setTypeFilter(null)}
-        >
-          {t('cat_all')}
-          <span className="muted" style={{ marginLeft: 6 }}>
-            {sets.filter((s) => normalizeCategory(s.category)).length}
-          </span>
-        </button>
-        {MASTERY_TYPES.map((id) => (
+            className="search"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={t('filter_placeholder')}
+          />
+          <label className="chip">
+            <input
+              type="checkbox"
+              checked={onlyIncomplete}
+              onChange={(e) => setOnlyIncomplete(e.target.checked)}
+            />{' '}
+            {t('incomplete_sets')}
+          </label>
+          {loading && (
+            <span className="muted" style={{ fontSize: '0.9rem' }}>
+              {t('loading')}
+            </span>
+          )}
+          {pricing && (
+            <span className="muted" style={{ fontSize: '0.9rem' }}>
+              {t('loading_prices')} {pricing.done}/{pricing.total}
+            </span>
+          )}
+        </div>
+        <div className="chips">
           <button
-            key={id}
             type="button"
-            className={`chip${typeFilter === id ? ' active' : ''}`}
-            onClick={() => setTypeFilter((cur) => (cur === id ? null : id))}
+            className={`chip${typeFilter == null ? ' active' : ''}`}
+            onClick={() => setTypeFilter(null)}
           >
-            {t(TYPE_I18N[id])}
+            {t('cat_all')}
             <span className="muted" style={{ marginLeft: 6 }}>
-              {typeCounts[id] || 0}
+              {sets.filter((s) => normalizeCategory(s.category)).length}
             </span>
           </button>
-        ))}
+          {MASTERY_TYPES.map((id) => (
+            <button
+              key={id}
+              type="button"
+              className={`chip${typeFilter === id ? ' active' : ''}`}
+              onClick={() => setTypeFilter((cur) => (cur === id ? null : id))}
+            >
+              {t(TYPE_I18N[id])}
+              <span className="muted" style={{ marginLeft: 6 }}>
+                {typeCounts[id] || 0}
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
-      {err && <div className="err">{err}</div>}
-      <div className="set-grid">
-        {filtered.map((s) => (
-          <SetCard
-            key={s.set_key}
-            set={s}
-            labels={{
-              owned: t('owned'),
-              vaulted: t('vaulted'),
-              unvaulted: t('unvaulted'),
-              mastered: t('mastered'),
-              absorbed: t('absorbed'),
-            }}
-          />
-        ))}
+      <div className="mastery-body">
+        {err && <div className="err">{err}</div>}
+        <div className="set-grid">
+          {filtered.map((s) => (
+            <SetCard
+              key={s.set_key}
+              set={s}
+              onSelectSet={
+                onSelectItem && s.url_name
+                  ? () =>
+                      onSelectItem(
+                        masterySelectionToItem({
+                          urlName: s.url_name!,
+                          name: (s.name_ru || s.name).replace(/<[^>]+>\s*/g, '').trim(),
+                          platinum: s.platinum,
+                          thumb: s.thumb,
+                        }),
+                      )
+                  : undefined
+              }
+              onSelectPart={
+                onSelectItem
+                  ? (p) => {
+                      if (!p.url_name) return
+                      onSelectItem(
+                        masterySelectionToItem({
+                          urlName: p.url_name,
+                          name: p.name || p.role,
+                          thumb: p.thumb,
+                          count: 1,
+                        }),
+                      )
+                    }
+                  : undefined
+              }
+              labels={{
+                owned: t('owned'),
+                vaulted: t('vaulted'),
+                unvaulted: t('unvaulted'),
+                mastered: t('mastered'),
+                absorbed: t('absorbed'),
+              }}
+            />
+          ))}
+        </div>
       </div>
-      {!filtered.length && !err && <div className="muted">{t('no_sets')}</div>}
-    </>
+    </div>
   )
 }

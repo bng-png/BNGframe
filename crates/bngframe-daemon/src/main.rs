@@ -130,12 +130,17 @@ async fn main() -> Result<()> {
                 let mut s = state.status.write().await;
                 s.inventory_loaded = r.item_count > 0;
             }
-            // Common UI icons
+            // Common UI icons (+ shared relic-tier art)
             imgcache
                 .warm([
                     "https://wiki.warframe.com/images/PlatinumLarge.png".into(),
                     "https://wiki.warframe.com/images/Platinum.png".into(),
                     "https://wiki.warframe.com/images/DucatsEmoji.png".into(),
+                    "https://wiki.warframe.com/images/LithRelicIntact.png".into(),
+                    "https://wiki.warframe.com/images/MesoRelicIntact.png".into(),
+                    "https://wiki.warframe.com/images/NeoRelicIntact.png".into(),
+                    "https://wiki.warframe.com/images/AxiRelicIntact.png".into(),
+                    "https://wiki.warframe.com/images/RequiemRelicIntact.png".into(),
                 ])
                 .await;
             // Profile glyph if known
@@ -156,37 +161,44 @@ async fn main() -> Result<()> {
                     let _ = state.set_error(format!("item cache: {e}")).await;
                 }
             }
-            // Bulk ducat values; plat seeds only when missing (stale → order book).
+            // Bulk ducat values; plat seeds only when missing.
             match pricing.warm_ducats_prices().await {
                 Ok(n) => info!("Startup ducats price warm: {n} seeded plat quotes"),
                 Err(e) => warn!("ducats price warm: {e:#}"),
             }
-            // First order-book pass (avg of 3 cheapest) so inventory isn't stuck on medians.
-            match pricing.refresh_hourly_prices(120).await {
+            // Order-book quotes for prime parts (avg of 3 cheapest) → OCR cache.
+            match pricing.refresh_prime_part_prices().await {
                 Ok(r) => info!(
-                    "Startup order-book price refresh: priced={} failed={} matched={}",
+                    "Startup prime-part price refresh: priced={} failed={} matched={}",
                     r.priced, r.failed, r.matched
                 ),
-                Err(e) => warn!("startup price refresh: {e:#}"),
+                Err(e) => warn!("startup prime price refresh: {e:#}"),
             }
         });
     }
 
-    // Hourly order-book refresh (avg of 3 cheapest sells, 1h cache TTL).
+    // Hourly: refresh inventory quotes + any aged cache entries.
     {
         let pricing = pricing.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await; // skip immediate tick — startup already refreshed
+            ticker.tick().await; // skip immediate tick — startup already refreshed primes
             loop {
                 ticker.tick().await;
-                match pricing.refresh_hourly_prices(200).await {
+                match pricing.refresh_prime_part_prices().await {
                     Ok(r) => info!(
-                        "Hourly price refresh: priced={} failed={} matched={}",
+                        "Hourly prime-part price refresh: priced={} failed={} matched={}",
                         r.priced, r.failed, r.matched
                     ),
-                    Err(e) => warn!("hourly price refresh: {e:#}"),
+                    Err(e) => warn!("hourly prime price refresh: {e:#}"),
+                }
+                match pricing.refresh_hourly_prices(120).await {
+                    Ok(r) => info!(
+                        "Hourly inventory price refresh: priced={} failed={} matched={}",
+                        r.priced, r.failed, r.matched
+                    ),
+                    Err(e) => warn!("hourly inventory price refresh: {e:#}"),
                 }
             }
         });
@@ -253,6 +265,17 @@ async fn main() -> Result<()> {
         mastery,
         imgcache,
     });
+
+    // Warm mastery set cache in the background so the first UI open is instant.
+    {
+        let mastery = services.mastery.clone();
+        tokio::spawn(async move {
+            match mastery.list_sets().await {
+                Ok(r) => info!("Mastery cache warmed ({} sets)", r.sets.len()),
+                Err(e) => warn!("Mastery warm failed: {e:#}"),
+            }
+        });
+    }
 
     let app = api::router(services.clone());
     let addr = cfg.listen_addr();

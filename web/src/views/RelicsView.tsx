@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { PartThumb } from '../components/PartThumb'
+import { relicTierFromText, relicTierImageUrls } from '../wikiImages'
 
 export function RelicsView({ t }: { t: (k: string) => string }) {
   const [relics, setRelics] = useState<any[]>([])
@@ -44,24 +46,32 @@ export function RelicsView({ t }: { t: (k: string) => string }) {
       </div>
       {err && <div className="err">{err}</div>}
       <div className="item-list">
-        {sorted.slice(0, 80).map((r) => (
-          <article key={r.name} className="item-card">
-            <div className="item-thumb placeholder">{r.tier || '?'}</div>
-            <div className="item-body">
-              <div className="item-title">{r.name}</div>
-              <div className="item-meta">
-                <span className="tag">{r.tier}</span>
-                <span>
-                  {t('col_owned')}: {r.owned ? t('yes') : t('no')}
-                </span>
-                <span>
-                  {t('col_score')}: {(r.score || 0).toFixed?.(1) ?? r.score}
-                </span>
-                <span className="muted">{r.drops?.[0]?.item_name || '—'}</span>
+        {sorted.slice(0, 80).map((r) => {
+          const tier =
+            relicTierFromText(
+              r.tier ? `${String(r.tier).toLowerCase()}_` : null,
+              r.name,
+            ) || relicTierFromText(null, r.tier)
+          const urls = tier ? relicTierImageUrls(tier) : []
+          return (
+            <article key={r.name} className="item-card">
+              <PartThumb urls={urls} size={72} />
+              <div className="item-body">
+                <div className="item-title">{r.name}</div>
+                <div className="item-meta">
+                  <span className="tag">{r.tier}</span>
+                  <span>
+                    {t('col_owned')}: {r.owned ? t('yes') : t('no')}
+                  </span>
+                  <span>
+                    {t('col_score')}: {(r.score || 0).toFixed?.(1) ?? r.score}
+                  </span>
+                  <span className="muted">{r.drops?.[0]?.item_name || '—'}</span>
+                </div>
               </div>
-            </div>
-          </article>
-        ))}
+            </article>
+          )
+        })}
       </div>
     </>
   )

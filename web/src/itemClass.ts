@@ -31,7 +31,7 @@ export function isRelicItem(item: Pick<InventoryItem, 'item_type' | 'unique_name
 }
 
 const SET_PART_URL =
-  /_(neuroptics|chassis|systems|blueprint|barrel|receiver|stock|blade|handle|link|grip|string|gauntlet|hilt|guard|carapace|cerebrum|lower_limb|upper_limb|pouch|stars)$/i
+  /_(neuroptics|helmet|chassis|systems|blueprint|barrel|receiver|stock|blade|handle|link|grip|string|gauntlet|hilt|guard|carapace|cerebrum|lower_limb|upper_limb|pouch|stars)$/i
 
 /** Set components (prime / wraith / etc. parts), not full weapon rows. */
 export function isSetPartItem(
@@ -42,12 +42,37 @@ export function isSetPartItem(
   const url = item.url_name || ''
   if (SET_PART_URL.test(url)) return true
   if (/weaponparts/i.test(item.unique_name || '')) return true
+  // DE stores neuroptics as *Helmet* under WarframeRecipes — still a set part.
+  const u = item.unique_name || ''
+  if (
+    /WarframeRecipes/i.test(u) &&
+    /(Helmet|Chassis|Systems)(Blueprint|Component)?/i.test(u) &&
+    !/KeyBlueprint/i.test(u)
+  ) {
+    return true
+  }
+  if (
+    /нейрооптик|каркас \(чертеж\)|систем \(чертеж\)|:\s*каркас|:\s*систем/i.test(item.name || '') ||
+    (/\(чертеж\)/i.test(item.name || '') && /нейро|каркас|систем/i.test(item.name || ''))
+  ) {
+    return true
+  }
   // WFM full-set listing (rare in inventory)
   if (/_set$/i.test(url) && !SET_PART_URL.test(url.replace(/_set$/i, ''))) {
-    // ash_prime_set ok; ash_prime_systems_set already matched SET_PART via systems… skip
     const stem = url.replace(/_set$/i, '')
     if (!SET_PART_URL.test(`_${stem.split('_').pop()}`)) return true
   }
+  return false
+}
+
+/** Rows that should appear in the inventory list (incl. parts without WFM url yet). */
+export function isInventoryListedItem(
+  item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'url_name' | 'name'>,
+): boolean {
+  if (item.url_name) return true
+  if (isRelicItem(item) || isArcaneItem(item)) return true
+  if (isSetPartItem(item)) return true
+  if (item.item_type === 'blueprint' || item.item_type === 'part') return true
   return false
 }
 
