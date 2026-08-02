@@ -12,7 +12,7 @@ export function remoteFromProxy(proxyOrRemote?: string | null): string | null {
   if (!proxyOrRemote) return null
   const u = proxyOrRemote.trim()
   if (!u) return null
-  if (u.starts_with('/api/img')) {
+  if (u.startsWith('/api/img')) {
     try {
       const q = new URL(u, 'http://local').searchParams.get('u')
       return q

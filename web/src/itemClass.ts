@@ -1,15 +1,19 @@
-import type { InventoryItem } from '../api'
+/** Minimal fields for category helpers (`url_name` optional, same as InventoryItem). */
+export type ItemClassInput = {
+  item_type: string
+  unique_name: string
+  name: string
+  url_name?: string | null
+}
 
 /** Arcanes / «мистики» (CosmeticEnhancers). */
-export function isArcaneItem(
-  item: Pick<InventoryItem, 'item_type' | 'unique_name'>,
-): boolean {
+export function isArcaneItem(item: ItemClassInput): boolean {
   if (item.item_type === 'arcane') return true
   return /\/cosmeticenhancers\//i.test(item.unique_name || '')
 }
 
 /** True for mods / upgrades (not arcanes, not prime parts). */
-export function isModItem(item: Pick<InventoryItem, 'item_type' | 'unique_name'>): boolean {
+export function isModItem(item: ItemClassInput): boolean {
   if (isArcaneItem(item)) return false
   if (item.item_type === 'mod') return true
   const u = item.unique_name || ''
@@ -24,7 +28,7 @@ export function isModItem(item: Pick<InventoryItem, 'item_type' | 'unique_name'>
   )
 }
 
-export function isRelicItem(item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'name'>): boolean {
+export function isRelicItem(item: ItemClassInput): boolean {
   if (item.item_type === 'relic') return true
   const u = item.unique_name || ''
   return /voidprojection/i.test(u) || /\/relics\//i.test(u) || /реликви/i.test(item.name || '')
@@ -34,9 +38,7 @@ const SET_PART_URL =
   /_(neuroptics|helmet|chassis|systems|blueprint|barrel|receiver|stock|blade|handle|link|grip|string|gauntlet|hilt|guard|carapace|cerebrum|lower_limb|upper_limb|pouch|stars)$/i
 
 /** Set components (prime / wraith / etc. parts), not full weapon rows. */
-export function isSetPartItem(
-  item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'url_name' | 'name'>,
-): boolean {
+export function isSetPartItem(item: ItemClassInput): boolean {
   if (isModItem(item) || isArcaneItem(item) || isRelicItem(item)) return false
   if (item.item_type === 'part') return true
   const url = item.url_name || ''
@@ -66,9 +68,7 @@ export function isSetPartItem(
 }
 
 /** Rows that should appear in the inventory list (incl. parts without WFM url yet). */
-export function isInventoryListedItem(
-  item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'url_name' | 'name'>,
-): boolean {
+export function isInventoryListedItem(item: ItemClassInput): boolean {
   if (item.url_name) return true
   if (isRelicItem(item) || isArcaneItem(item)) return true
   if (isSetPartItem(item)) return true
@@ -76,16 +76,14 @@ export function isInventoryListedItem(
   return false
 }
 
-function isBlueprintItem(item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'name'>): boolean {
+function isBlueprintItem(item: ItemClassInput): boolean {
   if (item.item_type === 'blueprint') return true
   const u = item.unique_name || ''
   return /#recipes$/i.test(u) || /blueprint/i.test(u) || /чертеж/i.test(item.name || '')
 }
 
 /** Everything tradeable that is not relic / mod / arcane / set part. */
-export function isMiscCategoryItem(
-  item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'url_name' | 'name'>,
-): boolean {
+export function isMiscCategoryItem(item: ItemClassInput): boolean {
   if (isRelicItem(item) || isModItem(item) || isArcaneItem(item) || isSetPartItem(item)) {
     return false
   }
@@ -96,9 +94,7 @@ export function isMiscCategoryItem(
  * Ground weapon slot for inventory filters.
  * Excludes mods (incl. stances), blueprints, archwing, operator amps.
  */
-export function weaponSlot(
-  item: Pick<InventoryItem, 'item_type' | 'unique_name' | 'name'>,
-): 'primary' | 'secondary' | 'melee' | null {
+export function weaponSlot(item: ItemClassInput): 'primary' | 'secondary' | 'melee' | null {
   if (isModItem(item) || isArcaneItem(item) || isBlueprintItem(item)) return null
 
   const u = (item.unique_name || '').toLowerCase()
