@@ -1,25 +1,24 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bngframe_capture::{
-    capture_for_rewards, reward_ui_score, warframe_is_on_active_workspace, CapturedImage,
-};
+use bngframe_capture::{capture_for_rewards, reward_ui_analysis};
 use bngframe_core::config::Config;
 use bngframe_core::db::{Database, ItemRow};
 use bngframe_core::ocr::{
-    display_name_for_item, fuzzy_match_item, fuzzy_match_items, ocr_reward_screen_engine,
-    reward_text_likely, OcrResult,
+    display_name_for_item, fuzzy_match_items, ocr_reward_screen_engine,
 };
 use bngframe_core::pricing::{
     resolve_lotus_reward_label, resolve_lotus_reward_path, PricingService,
 };
+use bngframe_core::reward_mem::{
+    is_confident_reward_path, is_plain_forma_path, HarvestDepth, RewardMemScanner,
+};
 use bngframe_core::state::{AppState, RewardSlot, RewardSnapshot};
 use bngframe_overlay::OverlayManager;
 use chrono::Utc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct RewardPipeline {
@@ -28,149 +27,140 @@ pub struct RewardPipeline {
     pub db: Arc<tokio::sync::Mutex<Database>>,
     pub pricing: Arc<PricingService>,
     pub overlay: Arc<OverlayManager>,
-    pub capture_path: PathBuf,
-    /// Frame grabbed on RewardScreenOpening (before Got rewards).
-    pub prefetch: Arc<tokio::sync::Mutex<Option<(Instant, CapturedImage)>>>,
-    /// Visual OCR already fired from a good prefetch (before Got rewards).
-    pub prefetch_ocr_fired: Arc<AtomicBool>,
-    /// Last visual OCR found catalog matches — Got rewards can skip heavy OCR.
-    pub visual_had_matches: Arc<AtomicBool>,
-    /// Set by Got-rewards pipeline so the prefetch loop can exit.
+    pub mem: Arc<RewardMemScanner>,
+    pub capture_path: std::path::PathBuf,
+    pub mem_had_matches: Arc<AtomicBool>,
+    pub prefetch_fired: Arc<AtomicBool>,
     pub cancel_prefetch: Arc<AtomicBool>,
-    /// Serialize reward pipeline runs (prefetch OCR vs Got rewards).
+    pub reward_window: Arc<AtomicBool>,
+    /// Prefetch finished Opening baseline freeze (Got should wait briefly).
+    pub baseline_ready: Arc<AtomicBool>,
     pub run_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RewardPipeline {
-    /// Start capture as soon as the reward SWF opens (before Got rewards).
-    /// Keeps refreshing until Got rewards cancels the loop or ~18s elapse.
-    pub async fn prefetch_capture(self: &Arc<Self>) {
+    /// Poll process memory while the reward SWF is open (before Got rewards).
+    pub async fn prefetch_memory(self: &Arc<Self>) {
+        if self
+            .reward_window
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
-            let slot = self.prefetch.lock().await;
-            if let Some((t, _)) = slot.as_ref() {
-                if t.elapsed() < Duration::from_secs(2) {
-                    // Another opening event — already prefetching.
-                    return;
-                }
-            }
+            // Already in Opening…Got window.
+            return;
         }
         self.cancel_prefetch.store(false, Ordering::SeqCst);
-        self.prefetch_ocr_fired.store(false, Ordering::SeqCst);
-        self.visual_had_matches.store(false, Ordering::SeqCst);
-        let monitor = self.cfg.read().await.monitor.clone();
-        let path = self.capture_path.clone();
-        let (ocr_lang, cache_dir) = {
-            let cfg = self.cfg.read().await;
-            (cfg.effective_ocr_lang(), cfg.cache_dir.clone())
-        };
-        info!("Prefetch capture loop on reward-screen opening");
+        self.prefetch_fired.store(false, Ordering::SeqCst);
+        self.mem_had_matches.store(false, Ordering::SeqCst);
+        self.baseline_ready.store(false, Ordering::SeqCst);
+        self.mem.clear_last_selected();
+
+        let consent = self.cfg.read().await.reward_memory_consent;
+        if !consent {
+            warn!("reward_memory_consent=false — skip memory prefetch");
+            self.baseline_ready.store(true, Ordering::SeqCst);
+            self.reward_window.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let mem = self.mem.clone();
+        match tokio::task::spawn_blocking(move || mem.refresh_baseline_depth(HarvestDepth::Fast))
+            .await
+        {
+            Ok(Ok(n)) => info!("Prefetch: baseline frozen ({n} StoreItems paths)"),
+            Ok(Err(e)) => warn!("Prefetch: baseline failed: {e:#}"),
+            Err(e) => warn!("Prefetch: baseline join: {e}"),
+        }
+        self.baseline_ready.store(true, Ordering::SeqCst);
+
+        info!("Prefetch memory loop on reward-screen opening (no overlay until EE)");
         let deadline = Instant::now() + Duration::from_secs(18);
-        let mut best: Option<(i32, CapturedImage)> = None;
-        let mut good_streak = 0u32;
+        let mut deep_once = false;
         while Instant::now() < deadline {
             if self.cancel_prefetch.load(Ordering::SeqCst) {
                 break;
             }
-            // Visual OCR matched — stop. If it's still running (or just missed),
-            // keep capturing better frames for the Got-rewards path; the worker
-            // clears prefetch_ocr_fired when the pass finds nothing.
-            if self.visual_had_matches.load(Ordering::SeqCst) {
-                break;
-            }
-            let path = path.clone();
-            let monitor_owned = monitor.clone();
-            let frame = match tokio::task::spawn_blocking(move || {
-                capture_for_rewards(monitor_owned.as_deref(), &path)
+
+            let mem = self.mem.clone();
+            let t_scan = Instant::now();
+            let scan = match tokio::task::spawn_blocking(move || {
+                mem.scan_depth(HarvestDepth::Fast, None, &[])
             })
             .await
             {
-                Ok(Ok(img)) => img,
+                Ok(Ok(s)) => {
+                    debug!("prefetch scan {:?}", t_scan.elapsed());
+                    s
+                }
                 Ok(Err(e)) => {
-                    warn!("prefetch capture failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    warn!("prefetch memory scan: {e:#}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
                 Err(e) => {
-                    warn!("prefetch join failed: {e}");
+                    warn!("prefetch memory join: {e}");
                     break;
                 }
             };
-            let score = reward_ui_score(&frame);
-            info!("Prefetch frame score={score}");
-            let better = best.as_ref().map(|(s, _)| score > *s).unwrap_or(true);
-            if better {
-                best = Some((score, frame.clone()));
-                let mut slot = self.prefetch.lock().await;
-                *slot = Some((Instant::now(), frame.clone()));
-            }
-            if score >= 20 {
-                good_streak += 1;
-            } else {
-                good_streak = 0;
-            }
-            // Wine often delays Got rewards ~10s while the UI is already up.
-            // Always probe for readable reward text — blue ability FX can score
-            // 100+ on a combat frame and must not skip the probe.
-            if good_streak >= 2
-                && score >= 20
-                && !self.prefetch_ocr_fired.load(Ordering::SeqCst)
-                && !self.cancel_prefetch.load(Ordering::SeqCst)
-            {
-                let probe_img = frame.clone();
-                let lang = ocr_lang.clone();
-                let cache = cache_dir.clone();
-                let text_ok = tokio::task::spawn_blocking(move || {
-                    reward_text_likely(&probe_img, &lang, &cache)
-                })
-                .await
-                .unwrap_or(false);
-                if text_ok
-                    && self
-                        .prefetch_ocr_fired
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                {
-                    info!("Prefetch: starting visual OCR (score={score}, text_probe=ok)");
-                    let img = frame.clone();
-                    let this = Arc::clone(self);
-                    tokio::spawn(async move {
-                        match this
-                            .run_with_paths_and_image("visual", &[], Some(img))
-                            .await
-                        {
-                            Ok(_) => {
-                                if !this.visual_had_matches.load(Ordering::SeqCst) {
-                                    // Empty/garbage frame — drop it and retry later.
-                                    this.prefetch_ocr_fired.store(false, Ordering::SeqCst);
-                                    let mut slot = this.prefetch.lock().await;
-                                    slot.take();
-                                    warn!("visual OCR found nothing — discarded frame, keep capturing");
-                                }
-                            }
-                            Err(e) => {
-                                warn!("visual OCR pipeline: {e}");
-                                this.prefetch_ocr_fired.store(false, Ordering::SeqCst);
-                            }
-                        }
+
+            // Accumulate only — local slot comes from EE `gets reward`.
+            // Early memory overlay was showing stale/other players' leftovers (Xaku).
+            if !scan.selected.is_empty() {
+                let n = self.mem.last_selected().len();
+                let confident = self
+                    .mem
+                    .last_selected()
+                    .iter()
+                    .filter(|p| is_confident_reward_path(p))
+                    .count();
+                info!(
+                    "Prefetch: banked {} path(s) (confident={confident}) in {:?}",
+                    n,
+                    t_scan.elapsed()
+                );
+                if !deep_once && confident < 3 {
+                    deep_once = true;
+                    let mem = self.mem.clone();
+                    let cache_dir = self.cfg.read().await.cache_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = mem.scan_depth(HarvestDepth::Deep, Some(&cache_dir), &[]);
                     });
-                } else if !text_ok {
-                    info!("Prefetch: score={score} but no reward text yet — keep capturing");
-                    // Don't burn the streak forever on a glowing combat frame.
-                    if score >= 80 {
-                        good_streak = 0;
-                    }
                 }
             }
-            if score >= 20 {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(280)).await;
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !self.cancel_prefetch.load(Ordering::SeqCst) {
+            self.reward_window.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Background baseline refresh while not in a reward window.
+    pub async fn baseline_refresher(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            if self.reward_window.load(Ordering::SeqCst) {
+                continue;
+            }
+            let consent = self.cfg.read().await.reward_memory_consent;
+            if !consent {
+                continue;
+            }
+            let mem = self.mem.clone();
+            match tokio::task::spawn_blocking(move || mem.refresh_baseline()).await {
+                Ok(Ok(n)) => {
+                    tracing::debug!("reward_mem baseline ok ({n} paths)");
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("reward_mem baseline skip: {e:#}");
+                }
+                Err(_) => {}
             }
         }
     }
 
     pub async fn run(&self, source: &str) -> Result<RewardSnapshot> {
-        self.run_with_paths(source, &[]).await
+        self.run_with_paths_party(source, &[], 4).await
     }
 
     pub async fn run_with_paths(
@@ -178,118 +168,51 @@ impl RewardPipeline {
         source: &str,
         reward_paths: &[String],
     ) -> Result<RewardSnapshot> {
-        self.run_with_paths_and_image(source, reward_paths, None)
-            .await
+        self.run_with_paths_party(source, reward_paths, 4).await
     }
 
-    pub async fn run_with_paths_and_image(
+    pub async fn run_with_paths_party(
         &self,
         source: &str,
         reward_paths: &[String],
-        forced_image: Option<CapturedImage>,
+        party_size: usize,
     ) -> Result<RewardSnapshot> {
+        let party_size = party_size.clamp(1, 4);
         let t0 = Instant::now();
         info!(
-            "Running reward pipeline (source={source}, ee_paths={})",
+            "Running reward pipeline (source={source}, paths={}, party={party_size})",
             reward_paths.len()
         );
+
+        let consent = self.cfg.read().await.reward_memory_consent;
+        if !consent {
+            warn!("reward_memory_consent=false — reward pipeline no-op");
+            let empty = RewardSnapshot {
+                id: Uuid::new_v4().to_string(),
+                detected_at: Utc::now(),
+                slots: vec![RewardSlot {
+                    name: "—".into(),
+                    matched_url_name: None,
+                    platinum: None,
+                    volume: None,
+                    ducats: None,
+                    owned: None,
+                    mastered: None,
+                    rank: Some(1),
+                }],
+                best_index: None,
+                source: format!("{source}:no_consent"),
+            };
+            return Ok(empty);
+        }
+
         if source == "eelog" {
             self.cancel_prefetch.store(true, Ordering::SeqCst);
-            self.prefetch_ocr_fired.store(true, Ordering::SeqCst);
-        }
-        // Visual OCR already showed squad rewards — Got rewards only needs EE merge.
-        let skip_ocr = source == "eelog" && self.visual_had_matches.load(Ordering::SeqCst);
-        if skip_ocr {
-            info!("Got rewards: visual already matched — EE notify only (skip capture/OCR)");
+            self.prefetch_fired.store(true, Ordering::SeqCst);
         }
 
-        let (monitor, ocr_lang, cache_dir, prefer_ru, prefer_rapid) = {
-            let cfg = self.cfg.read().await;
-            (
-                cfg.monitor.clone(),
-                cfg.effective_ocr_lang(),
-                cfg.cache_dir.clone(),
-                cfg.prefer_russian_names(),
-                cfg.use_rapidocr(),
-            )
-        };
-
-        // Prefer forced image (visual path), else fresh prefetch, else burst.
-        let prefetched = if skip_ocr {
-            None
-        } else if let Some(img) = forced_image {
-            let score = reward_ui_score(&img);
-            info!("Using forced capture (score={score})");
-            Some(img)
-        } else {
-            let mut slot = self.prefetch.lock().await;
-            match slot.as_ref() {
-                Some((t, img)) if t.elapsed() < Duration::from_secs(20) => {
-                    let score = reward_ui_score(img);
-                    if score >= 12 {
-                        info!(
-                            "Using prefetched reward capture ({:?} old, score={score})",
-                            t.elapsed()
-                        );
-                        // Clone so visual OCR / Got can both use a fresh-ish frame.
-                        let img = img.clone();
-                        if source == "eelog" {
-                            slot.take();
-                        }
-                        Some(img)
-                    } else {
-                        info!(
-                            "Prefetch score too low ({score}) — capturing again ({:?} old)",
-                            t.elapsed()
-                        );
-                        if source == "eelog" {
-                            slot.take();
-                        }
-                        None
-                    }
-                }
-                Some(_) => {
-                    info!("Prefetch too old — capturing again");
-                    if source == "eelog" {
-                        slot.take();
-                    }
-                    None
-                }
-                None => None,
-            }
-        };
-        let capture_task = if skip_ocr {
-            None
-        } else {
-            let monitor = monitor.clone();
-            let this_path = self.capture_path.clone();
-            let source = source.to_string();
-            let already = prefetched;
-            Some(tokio::spawn(async move {
-                if let Some(img) = already {
-                    return Some(img);
-                }
-                if source == "eelog" || source == "visual" {
-                    capture_reward_burst(&this_path, monitor.as_deref()).await
-                } else {
-                    match tokio::task::spawn_blocking(move || {
-                        capture_for_rewards(monitor.as_deref(), &this_path)
-                    })
-                    .await
-                    {
-                        Ok(Ok(img)) => Some(img),
-                        Ok(Err(e)) => {
-                            warn!("screen capture failed: {e}");
-                            None
-                        }
-                        Err(e) => {
-                            warn!("capture join failed: {e}");
-                            None
-                        }
-                    }
-                }
-            }))
-        };
+        let prefer_ru = self.cfg.read().await.prefer_russian_names();
+        let cache_dir = self.cfg.read().await.cache_dir.clone();
 
         let pricing = self.pricing.clone();
         let catalog_task = tokio::spawn(async move { pricing.ensure_items_cached().await });
@@ -311,217 +234,153 @@ impl RewardPipeline {
             (catalog, lotus)
         };
 
-        let (ee_items, ee_labels) = resolve_ee_rewards(reward_paths, &catalog, &lotus, prefer_ru);
-        let reward_id = Uuid::new_v4().to_string();
-
-        // Squad rewards already read from the screen by the earlier visual pass.
-        // Must be captured *before* pushing the EE snapshot, otherwise the lookup
-        // finds this run's own EE-only snapshot and the OCR slots are dropped.
-        let visual_urls: Vec<String> = if skip_ocr {
-            let q = self.state.last_rewards.read().await;
-            q.iter()
-                .find(|r| r.source.starts_with("visual"))
-                .map(|r| {
-                    r.slots
-                        .iter()
-                        .filter_map(|s| s.matched_url_name.clone())
-                        .collect()
-                })
-                .unwrap_or_default()
+        let ee_paths = if source == "eelog" {
+            reward_paths.to_vec()
         } else {
             Vec::new()
         };
-        let visual_items: Vec<&ItemRow> = visual_urls
-            .iter()
-            .filter(|url| !ee_items.iter().any(|e| e.url_name == **url))
-            .filter_map(|url| catalog.iter().find(|i| i.url_name == *url))
-            .collect();
 
-        // Fast path: EE notify WITHOUT the OCR lock so Wine-delayed Got rewards
-        // still alert while a visual OCR pass holds run_lock.
+        let mut mem_paths = if source == "memory" {
+            reward_paths.to_vec()
+        } else {
+            self.mem.last_selected()
+        };
+        // Prefetch may still hold leftovers; keep only confident primes for squad fill.
+        if source == "eelog" {
+            mem_paths.retain(|p| is_confident_reward_path(p));
+        }
+
+        let reward_id = Uuid::new_v4().to_string();
         let mut early_announced = false;
-        if !ee_items.is_empty() || !ee_labels.is_empty() {
-            let mut early_slots = Vec::new();
-            for item in &ee_items {
-                early_slots.push(self.slot_from_item(item, prefer_ru).await);
-            }
-            for (label, url) in &ee_labels {
-                early_slots.push(RewardSlot {
-                    name: label.clone(),
-                    matched_url_name: url.clone(),
-                    platinum: None,
-                    volume: None,
-                    ducats: None,
-                    owned: None,
-                    mastered: None,
-                    rank: Some(1),
-                });
-            }
-            for item in &visual_items {
-                if early_slots.len() >= 4 {
-                    break;
+
+        // Local slot is EE truth — announce it immediately, before any Deep scan.
+        if source == "eelog" && !ee_paths.is_empty() {
+            let (local_items, local_labels) =
+                resolve_paths_to_items(&ee_paths, &catalog, &lotus, prefer_ru);
+            if !local_items.is_empty() || !local_labels.is_empty() {
+                let mut early_slots = Vec::new();
+                for item in &local_items {
+                    early_slots.push(self.slot_from_item(item, prefer_ru).await);
                 }
-                early_slots.push(self.slot_from_item(item, prefer_ru).await);
-            }
-            rank_slots(&mut early_slots);
-            let best_index = early_slots
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, s)| s.rank.unwrap_or(99))
-                .map(|(i, _)| i);
-            let early = RewardSnapshot {
-                id: reward_id.clone(),
-                detected_at: Utc::now(),
-                slots: early_slots,
-                best_index,
-                source: format!("{source}:early"),
-            };
-            self.state.push_reward(early.clone()).await;
-            if let Err(e) = self.overlay.show_rewards(&early).await {
-                warn!("early EE notify: {e}");
-            } else {
-                early_announced = true;
-                self.state.emit(bngframe_core::AppEvent::OverlayShown {
-                    reward_id: early.id.clone(),
-                });
-                info!(
-                    "EE notify (cached prices) in {:?} — {} item(s)",
-                    t0.elapsed(),
-                    ee_items.len() + ee_labels.len()
-                );
+                for (label, url) in &local_labels {
+                    early_slots.push(RewardSlot {
+                        name: label.clone(),
+                        matched_url_name: url.clone(),
+                        platinum: None,
+                        volume: None,
+                        ducats: None,
+                        owned: None,
+                        mastered: None,
+                        rank: Some(1),
+                    });
+                }
+                assign_rank_badges(&mut early_slots);
+                let best_index = early_slots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.rank.unwrap_or(99))
+                    .map(|(i, _)| i);
+                let early = RewardSnapshot {
+                    id: reward_id.clone(),
+                    detected_at: Utc::now(),
+                    slots: early_slots,
+                    best_index,
+                    source: format!("{source}:local"),
+                };
+                self.state.push_reward(early.clone()).await;
+                if let Err(e) = self.overlay.show_rewards(&early).await {
+                    warn!("local EE reward notify: {e}");
+                } else {
+                    early_announced = true;
+                    self.state.emit(bngframe_core::AppEvent::OverlayShown {
+                        reward_id: early.id.clone(),
+                    });
+                    info!(
+                        "Reward notify (EE local) in {:?} — {:?}",
+                        t0.elapsed(),
+                        ee_paths
+                    );
+                }
             }
         }
 
         let _guard = self.run_lock.lock().await;
 
-        let capture = if skip_ocr {
-            None
-        } else if let Some(task) = capture_task {
-            match task.await {
-                Ok(img) => img,
-                Err(e) => {
-                    warn!("capture task join failed: {e}");
-                    None
-                }
+        // Wait for Opening baseline if prefetch is in flight (same EE flush).
+        if source == "eelog" && !self.baseline_ready.load(Ordering::SeqCst) {
+            let wait_deadline = Instant::now() + Duration::from_millis(1500);
+            while !self.baseline_ready.load(Ordering::SeqCst) && Instant::now() < wait_deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        } else {
-            None
-        };
-        if !skip_ocr {
-            info!("Capture phase done in {:?}", t0.elapsed());
         }
 
-        let mut ocr = if skip_ocr {
-            OcrResult {
-                raw_lines: vec![],
-                slot_texts: vec![],
-            }
-        } else {
-            match capture {
-                Some(img) => {
-                    let ocr_lang = ocr_lang.clone();
-                    let cache_dir = cache_dir.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        ocr_reward_screen_engine(&img, &ocr_lang, &cache_dir, prefer_rapid)
-                    })
-                    .await
-                    {
-                        Ok(Ok(o)) => o,
-                        Ok(Err(e)) => {
-                            warn!("OCR failed: {e}");
-                            OcrResult {
-                                raw_lines: vec![],
-                                slot_texts: vec![],
-                            }
-                        }
-                        Err(e) => {
-                            warn!("OCR task join failed: {e}");
-                            OcrResult {
-                                raw_lines: vec![],
-                                slot_texts: vec![],
-                            }
-                        }
-                    }
+        let confident_so_far = {
+            let mut s = std::collections::HashSet::new();
+            for p in mem_paths.iter().chain(ee_paths.iter()) {
+                if is_confident_reward_path(p) || is_plain_forma_path(p) {
+                    s.insert(p.clone());
                 }
-                None => OcrResult {
-                    raw_lines: vec![],
-                    slot_texts: vec![],
-                },
             }
+            s.len()
         };
-
-        let ocr_empty = ocr.slot_texts.iter().all(|t| t.trim().is_empty());
-        // Retry once when OCR found nothing — but not after a successful visual pass.
-        if ocr_empty && source == "eelog" && !skip_ocr {
-            info!("OCR empty — retrying capture+OCR once");
-            tokio::time::sleep(Duration::from_millis(320)).await;
-            let capture_path = self.capture_path.clone();
-            let monitor_owned = monitor.clone();
-            let ocr_lang = ocr_lang.clone();
-            let cache_dir = cache_dir.clone();
+        let need_rescan =
+            source == "manual" || (source == "eelog" && party_size > confident_so_far);
+        if need_rescan && source != "memory" {
+            let mem = self.mem.clone();
+            let cache = cache_dir.clone();
+            let hints = ee_paths.clone();
+            let max_slots = party_size;
+            // Deep matches Fast baseline coverage class; Exhaustive flooded "new".
+            let t_deep = Instant::now();
             match tokio::task::spawn_blocking(move || {
-                let img = capture_for_rewards(monitor_owned.as_deref(), &capture_path)?;
-                ocr_reward_screen_engine(&img, &ocr_lang, &cache_dir, prefer_rapid)
+                mem.scan_depth_capped(HarvestDepth::Deep, Some(&cache), &hints, max_slots)
             })
             .await
             {
-                Ok(Ok(o)) => {
-                    info!("OCR retry done in {:?}", t0.elapsed());
-                    ocr = o;
+                Ok(Ok(scan)) => {
+                    info!(
+                        "Got mem Deep in {:?} all={} new={} selected={} (before={confident_so_far}/{party_size})",
+                        t_deep.elapsed(),
+                        scan.all_paths.len(),
+                        scan.new_paths.len(),
+                        scan.selected.len()
+                    );
+                    for p in scan.selected {
+                        if !mem_paths.iter().any(|x| x == &p) {
+                            mem_paths.push(p);
+                        }
+                    }
+                    mem_paths.retain(|p| {
+                        is_confident_reward_path(p)
+                            || ee_paths.iter().any(|e| e == p)
+                            || is_plain_forma_path(p)
+                    });
                 }
-                Ok(Err(e)) => warn!("OCR retry failed: {e}"),
-                Err(e) => warn!("OCR retry join failed: {e}"),
+                Ok(Err(e)) => warn!("memory Deep scan failed: {e:#}"),
+                Err(e) => warn!("memory Deep join failed: {e}"),
             }
-        }
-        if !skip_ocr {
-            info!("OCR done in {:?}", t0.elapsed());
+        } else if source == "eelog" {
+            info!(
+                "Got rewards: reuse prefetch mem ({} path(s), ≈{confident_so_far}/{party_size})",
+                mem_paths.len()
+            );
         }
 
-        let mut ocr_matches: Vec<&ItemRow> = Vec::new();
-        for text in &ocr.slot_texts {
-            if text.trim().is_empty() {
-                continue;
-            }
-            for item in fuzzy_match_items(text, &catalog) {
-                if ocr_matches.iter().any(|m| m.url_name == item.url_name) {
-                    continue;
-                }
-                if ee_items.iter().any(|e| e.url_name == item.url_name) {
-                    continue;
-                }
-                if ee_labels
-                    .iter()
-                    .any(|(label, _)| label_matches_item(label, item, prefer_ru))
-                {
-                    continue;
-                }
-                info!("OCR matched: {text:?} → {}", item.url_name);
-                ocr_matches.push(item);
-            }
-        }
-        if source == "visual" && !ocr_matches.is_empty() {
-            self.visual_had_matches.store(true, Ordering::SeqCst);
-        }
-        // Fresh OCR findings only — visual slots merged below were already announced.
-        let ocr_added = !ocr_matches.is_empty();
-
-        // Carry the visual pass results into this snapshot so the EE run keeps
-        // showing the whole squad instead of just the local reward.
-        for item in &visual_items {
-            if ocr_matches.iter().any(|m| m.url_name == item.url_name) {
-                continue;
-            }
-            ocr_matches.push(item);
-        }
-
+        // EE local first (stable order), then memory squad, then OCR.
         let mut slots = Vec::new();
         let mut matched_count = 0usize;
+        let mut seen_urls = std::collections::HashSet::new();
 
-        for item in &ee_items {
+        let (local_items, local_labels) =
+            resolve_paths_to_items(&ee_paths, &catalog, &lotus, prefer_ru);
+        for item in &local_items {
+            if !seen_urls.insert(item.url_name.clone()) {
+                continue;
+            }
             matched_count += 1;
             slots.push(self.slot_from_item(item, prefer_ru).await);
         }
-        for (label, url) in &ee_labels {
+        for (label, url) in &local_labels {
             matched_count += 1;
             slots.push(RewardSlot {
                 name: label.clone(),
@@ -534,12 +393,114 @@ impl RewardPipeline {
                 rank: None,
             });
         }
-        for item in &ocr_matches {
-            if slots.len() >= 4 {
+
+        let mem_only: Vec<String> = mem_paths
+            .iter()
+            .filter(|p| !ee_paths.iter().any(|e| e == *p))
+            .cloned()
+            .collect();
+        let (mem_items, mem_labels) =
+            resolve_paths_to_items(&mem_only, &catalog, &lotus, prefer_ru);
+        for item in &mem_items {
+            if slots.len() >= party_size {
                 break;
+            }
+            if !seen_urls.insert(item.url_name.clone()) {
+                continue;
             }
             matched_count += 1;
             slots.push(self.slot_from_item(item, prefer_ru).await);
+        }
+        for (label, url) in &mem_labels {
+            if slots.len() >= party_size {
+                break;
+            }
+            matched_count += 1;
+            slots.push(RewardSlot {
+                name: label.clone(),
+                matched_url_name: url.clone(),
+                platinum: None,
+                volume: None,
+                ducats: None,
+                owned: None,
+                mastered: None,
+                rank: None,
+            });
+        }
+
+        info!(
+            "After EE+mem: {}/{} slots (ee={} mem_extra={})",
+            slots.len(),
+            party_size,
+            ee_paths.len(),
+            mem_only.len()
+        );
+
+        // Proton rarely exposes other players' StoreItems — OCR fills remaining cards.
+        let mut ocr_added = false;
+        if slots.len() < party_size && source == "eelog" {
+            let (ocr_lang, prefer_rapid, monitor) = {
+                let cfg = self.cfg.read().await;
+                (
+                    cfg.effective_ocr_lang(),
+                    cfg.use_rapidocr(),
+                    cfg.monitor.clone(),
+                )
+            };
+            info!(
+                "Slots {}/{} — OCR for remaining squad cards",
+                slots.len(),
+                party_size
+            );
+            let capture_path = self.capture_path.clone();
+            let monitor_owned = monitor.clone();
+            let cache = cache_dir.clone();
+            let t_ocr = Instant::now();
+            let ocr_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let img = capture_for_rewards(monitor_owned.as_deref(), &capture_path)?;
+                let analysis = reward_ui_analysis(&img);
+                if analysis.score < 12 {
+                    anyhow::bail!("capture score too low ({})", analysis.score);
+                }
+                let hint = match analysis.peaks {
+                    2..=4 => Some(analysis.peaks as u32),
+                    _ => None,
+                };
+                let ocr =
+                    ocr_reward_screen_engine(&img, &ocr_lang, &cache, prefer_rapid, hint)?;
+                Ok(ocr.slot_texts)
+            })
+            .await;
+            match ocr_result {
+                Ok(Ok(texts)) => {
+                    info!("OCR texts in {:?}: {:?}", t_ocr.elapsed(), texts);
+                    for text in texts {
+                        if slots.len() >= party_size {
+                            break;
+                        }
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        for item in fuzzy_match_items(&text, &catalog) {
+                            if seen_urls.contains(&item.url_name) {
+                                continue;
+                            }
+                            info!("OCR matched: {text:?} → {}", item.url_name);
+                            seen_urls.insert(item.url_name.clone());
+                            matched_count += 1;
+                            ocr_added = true;
+                            slots.push(self.slot_from_item(item, prefer_ru).await);
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => warn!("OCR fill failed: {e:#}"),
+                Err(e) => warn!("OCR join failed: {e}"),
+            }
+        }
+
+        if source == "memory" && matched_count > 0 {
+            self.mem_had_matches.store(true, Ordering::SeqCst);
         }
 
         if slots.is_empty() {
@@ -555,7 +516,7 @@ impl RewardPipeline {
             });
         }
 
-        rank_slots(&mut slots);
+        assign_rank_badges(&mut slots);
         let best_index = if matched_count > 0 {
             slots
                 .iter()
@@ -574,32 +535,35 @@ impl RewardPipeline {
             source: source.into(),
         };
 
-        self.state.push_reward(reward.clone()).await;
+        if source == "eelog" {
+            self.reward_window.store(false, Ordering::SeqCst);
+        }
 
         if matched_count == 0 {
-            warn!(
-                "No catalog matches (source={source}); skipping overlay. OCR={:?} ee_paths={reward_paths:?}",
-                ocr.slot_texts
-            );
+            warn!("No catalog matches (source={source}); skipping overlay");
+            if source != "memory" {
+                self.state.push_reward(reward.clone()).await;
+            }
             return Ok(reward);
         }
 
-        // Re-notify when OCR found extra squad rewards, or when there was no EE alert.
-        if !early_announced || ocr_added {
+        self.state.push_reward(reward.clone()).await;
+
+        if !early_announced || ocr_added || reward.slots.len() > 1 {
             self.overlay.show_rewards(&reward).await?;
             self.state.emit(bngframe_core::AppEvent::OverlayShown {
                 reward_id: reward.id.clone(),
             });
             info!(
-                "OCR catch-up notify in {:?} ({} slots, ocr_added={ocr_added})",
+                "Reward notify in {:?} ({} slots, ocr_added={ocr_added})",
                 t0.elapsed(),
                 reward.slots.len()
             );
         } else if let Err(e) = self.overlay.update_rewards(&reward).await {
-            warn!("silent OCR update: {e}");
+            warn!("silent reward update: {e}");
         } else {
             info!(
-                "OCR done, no new slots — kept EE notify ({:?}, {} slots)",
+                "Reward done — kept early notify ({:?}, {} slots)",
                 t0.elapsed(),
                 reward.slots.len()
             );
@@ -611,8 +575,6 @@ impl RewardPipeline {
     async fn slot_from_item(&self, item: &ItemRow, prefer_ru: bool) -> RewardSlot {
         let mut platinum = None;
         let mut volume = None;
-        // OCR notifications use the local cache only — no live WFM round-trip.
-        // Prime-part quotes are refreshed on daemon startup (avg of 3 cheapest).
         if item.url_name != "forma" {
             if let Some(p) = self.pricing.price_cached_only(&item.url_name).await {
                 if p.platinum > 0.0 {
@@ -634,100 +596,34 @@ impl RewardPipeline {
     }
 }
 
-/// Grab a couple of frames while the relic UI paints; stop as soon as one looks good.
-async fn capture_reward_burst(
-    capture_path: &std::path::Path,
-    monitor: Option<&str>,
-) -> Option<CapturedImage> {
-    if !warframe_is_on_active_workspace() {
-        warn!("Warframe not on active workspace at burst start — capturing anyway");
-    }
-    // Keep this short: each grim is ~0.8–1.4s. Two attempts beat four.
-    // Absolute times from Got-rewards; early-exit when UI score is good.
-    const DELAYS_MS: &[u64] = &[150, 400];
-    const GOOD_ENOUGH: i32 = 20;
-    let mut best: Option<(i32, CapturedImage)> = None;
-    for (i, &delay) in DELAYS_MS.iter().enumerate() {
-        if i == 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        } else {
-            let prev = DELAYS_MS[i - 1];
-            tokio::time::sleep(Duration::from_millis(delay.saturating_sub(prev))).await;
-        }
-        // Always write the working capture to last_capture — avoids extra disk churn.
-        let path = capture_path.to_path_buf();
-        let monitor_owned = monitor.map(|s| s.to_string());
-        let frame = match tokio::task::spawn_blocking(move || {
-            capture_for_rewards(monitor_owned.as_deref(), &path)
-        })
-        .await
-        {
-            Ok(Ok(img)) => img,
-            Ok(Err(e)) => {
-                warn!("burst capture {i} failed: {e}");
-                continue;
-            }
-            Err(e) => {
-                warn!("burst capture {i} join failed: {e}");
-                continue;
-            }
-        };
-        let score = reward_ui_score(&frame);
-        info!("Burst frame {i} score={score}");
-        let better = best.as_ref().map(|(s, _)| score > *s).unwrap_or(true);
-        if better {
-            best = Some((score, frame));
-        }
-        if score >= GOOD_ENOUGH {
-            info!("Burst early-stop on frame {i} (score={score})");
-            break;
-        }
-    }
-    match best {
-        Some((score, img)) if score > 0 => {
-            info!("Selected burst frame score={score}");
-            Some(img)
-        }
-        Some((score, img)) => {
-            warn!("Burst frames never looked like relic UI (best score={score})");
-            Some(img)
-        }
-        None => None,
-    }
-}
-fn resolve_ee_rewards<'a>(
-    reward_paths: &[String],
+fn resolve_paths_to_items<'a>(
+    paths: &[String],
     catalog: &'a [ItemRow],
     lotus: &std::collections::HashMap<String, String>,
     prefer_ru: bool,
 ) -> (Vec<&'a ItemRow>, Vec<(String, Option<String>)>) {
-    let mut ee_items = Vec::new();
-    let mut ee_labels = Vec::new();
-    for path in reward_paths {
+    let mut items = Vec::new();
+    let mut labels = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
         if let Some(item) = resolve_lotus_reward_path(path, catalog) {
-            info!("EE path matched: {path} → {}", item.url_name);
-            ee_items.push(item);
-        } else if let Some(label) = resolve_lotus_reward_label(path, lotus, prefer_ru) {
-            info!("EE path label (no WFM): {path} → {label}");
-            ee_labels.push((label, None));
+            if seen.insert(item.url_name.clone()) {
+                info!("path matched: {path} → {}", item.url_name);
+                items.push(item);
+            }
+            continue;
+        }
+        if let Some(label) = resolve_lotus_reward_label(path, lotus, prefer_ru) {
+            info!("path label (no WFM): {path} → {label}");
+            labels.push((label, None));
         } else {
-            warn!("EE path unmatched: {path}");
+            warn!("path unmatched: {path}");
         }
     }
-    (ee_items, ee_labels)
+    (items, labels)
 }
 
-fn label_matches_item(label: &str, item: &ItemRow, prefer_ru: bool) -> bool {
-    let disp = display_name_for_item(item, prefer_ru).to_lowercase();
-    let lab = label.to_lowercase();
-    if disp == lab {
-        return true;
-    }
-    // "Ортос Прайм: Клинок" vs catalog row
-    fuzzy_match_item(label, std::slice::from_ref(item)).is_some()
-}
-
-fn rank_slots(slots: &mut [RewardSlot]) {
+fn assign_rank_badges(slots: &mut [RewardSlot]) {
     let mut order: Vec<usize> = (0..slots.len()).collect();
     order.sort_by(|&a, &b| {
         let pa = slots[a].platinum.unwrap_or(-1.0);

@@ -12,6 +12,7 @@ pub mod ocr;
 pub mod pricing;
 pub mod rapidocr;
 pub mod relics;
+pub mod reward_mem;
 pub mod rivens;
 pub mod state;
 pub mod stats;

@@ -17,6 +17,29 @@ pub struct CraftGearIng {
     pub count: i64,
 }
 
+/// One ExportRecipes row, indexed for foundry trees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoundryRecipeEntry {
+    pub result_type: String,
+    pub blueprint_unique: String,
+    pub build_time: i64,
+    pub ingredients: Vec<FoundryIngredient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoundryIngredient {
+    pub unique_name: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FoundryRecipesCache {
+    /// resultType → recipe (highest specificity wins).
+    pub by_result: HashMap<String, FoundryRecipeEntry>,
+    /// mastery set_key → finished product resultType.
+    pub set_to_result: HashMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WfmItemsV2 {
     data: Option<Vec<WfmItemV2>>,
@@ -278,6 +301,7 @@ impl PricingService {
         let _ = self.refresh_lotus_extra_ru_names().await;
         let _ = self.refresh_craft_gear_recipes().await;
         let _ = self.refresh_craft_part_qty().await;
+        let _ = self.refresh_foundry_recipes().await;
         let db = self.db.lock().await;
         db.lotus_name_map_all()
     }
@@ -494,7 +518,9 @@ impl PricingService {
                 .get("resultType")
                 .and_then(|x| x.as_str())
                 .unwrap_or("");
-            let Some(set_key) = craft_set_key_for_recipe(unique, result, &weapons_en) else {
+            let Some(set_key) =
+                craft_set_key_for_recipe(unique, result, &weapons_en, None)
+            else {
                 continue;
             };
             let Some(ings) = recipe.get("ingredients").and_then(|x| x.as_array()) else {
@@ -624,7 +650,9 @@ impl PricingService {
             if is_component_blueprint_leaf(unique) {
                 continue;
             }
-            let Some(set_key) = craft_set_key_for_recipe(unique, result, &weapons_en) else {
+            let Some(set_key) =
+                craft_set_key_for_recipe(unique, result, &weapons_en, None)
+            else {
                 continue;
             };
             let Some(ings) = recipe.get("ingredients").and_then(|x| x.as_array()) else {
@@ -690,6 +718,200 @@ impl PricingService {
         let _ = self.refresh_craft_part_qty().await;
         let db = self.db.lock().await;
         db.get_setting("craft_part_qty")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Full ExportRecipes index for foundry craft trees.
+    pub async fn refresh_foundry_recipes(&self) -> Result<usize> {
+        {
+            let db = self.db.lock().await;
+            let ver = db.get_setting("foundry_recipes_ver").ok().flatten();
+            if ver.as_deref() == Some(FOUNDRY_RECIPES_VER) {
+                if let Ok(Some(raw)) = db.get_setting("foundry_recipes") {
+                    if let Ok(cache) = serde_json::from_str::<FoundryRecipesCache>(&raw) {
+                        if cache.by_result.len() >= 100 {
+                            return Ok(cache.by_result.len());
+                        }
+                    }
+                }
+            }
+        }
+        info!("Fetching DE ExportRecipes for foundry trees…");
+        let v = self
+            .fetch_de_export_json("ExportRecipes_en.json")
+            .await
+            .context("ExportRecipes_en")?;
+        let weapons_en = self
+            .fetch_export_weapons_en_names()
+            .await
+            .unwrap_or_default();
+        let frames_en = self
+            .fetch_de_export_json("ExportWarframes_en.json")
+            .await
+            .ok()
+            .and_then(|jv| {
+                let mut m = HashMap::new();
+                let arr = jv.get("ExportWarframes")?.as_array()?;
+                for row in arr {
+                    let u = row.get("uniqueName")?.as_str()?;
+                    let n = row
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    let cleaned = strip_export_tags(n);
+                    if !u.is_empty() && !cleaned.is_empty() {
+                        m.insert(u.to_string(), cleaned);
+                    }
+                }
+                Some(m)
+            })
+            .unwrap_or_default();
+        let arr = v
+            .get("ExportRecipes")
+            .and_then(|x| x.as_array())
+            .context("ExportRecipes array")?;
+
+        let mut by_result: HashMap<String, FoundryRecipeEntry> = HashMap::new();
+        let mut set_to_result: HashMap<String, String> = HashMap::new();
+
+        for recipe in arr {
+            let blueprint_unique = recipe
+                .get("uniqueName")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let result_type = recipe
+                .get("resultType")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if blueprint_unique.is_empty() || result_type.is_empty() {
+                continue;
+            }
+            let build_time = recipe
+                .get("buildTime")
+                .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64)))
+                .unwrap_or(0);
+            let mut ingredients = Vec::new();
+            if let Some(ings) = recipe.get("ingredients").and_then(|x| x.as_array()) {
+                for ing in ings {
+                    let item = ing
+                        .get("ItemType")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if item.is_empty() {
+                        continue;
+                    }
+                    let count = ing
+                        .get("ItemCount")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(1)
+                        .max(1);
+                    ingredients.push(FoundryIngredient {
+                        unique_name: item,
+                        count,
+                    });
+                }
+            }
+            if let Some(secret) = recipe.get("secretIngredients").and_then(|x| x.as_array()) {
+                for ing in secret {
+                    let item = ing
+                        .get("ItemType")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if item.is_empty() {
+                        continue;
+                    }
+                    let count = ing
+                        .get("ItemCount")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(1)
+                        .max(1);
+                    ingredients.push(FoundryIngredient {
+                        unique_name: item,
+                        count,
+                    });
+                }
+            }
+            let entry = FoundryRecipeEntry {
+                result_type: result_type.clone(),
+                blueprint_unique: blueprint_unique.clone(),
+                build_time,
+                ingredients,
+            };
+            let spec = recipe_specificity(&entry.ingredients);
+            let replace = match by_result.get(&result_type) {
+                None => true,
+                Some(prev) => recipe_specificity(&prev.ingredients) < spec,
+            };
+            if replace {
+                by_result.insert(result_type.clone(), entry);
+            }
+
+            // Index finished gear / frames by mastery set_key.
+            if is_component_blueprint_leaf(&blueprint_unique) {
+                continue;
+            }
+            let set_key = craft_set_key_for_recipe(
+                &blueprint_unique,
+                &result_type,
+                &weapons_en,
+                Some(&frames_en),
+            );
+            if let Some(sk) = set_key {
+                let better = match set_to_result.get(&sk) {
+                    None => true,
+                    Some(prev_rt) => {
+                        let prev_spec = by_result
+                            .get(prev_rt)
+                            .map(|e| recipe_specificity(&e.ingredients))
+                            .unwrap_or(0);
+                        spec >= prev_spec
+                    }
+                };
+                if better {
+                    set_to_result.insert(sk, result_type);
+                }
+            }
+        }
+
+        let n = by_result.len();
+        let cache = FoundryRecipesCache {
+            by_result,
+            set_to_result,
+        };
+        let raw = serde_json::to_string(&cache)?;
+        {
+            let db = self.db.lock().await;
+            db.set_setting("foundry_recipes", &raw)?;
+            db.set_setting("foundry_recipes_ver", FOUNDRY_RECIPES_VER)?;
+        }
+        info!("Cached foundry recipes: {n} results");
+        Ok(n)
+    }
+
+    pub async fn foundry_recipes_cache(&self) -> FoundryRecipesCache {
+        {
+            let db = self.db.lock().await;
+            let ver = db.get_setting("foundry_recipes_ver").ok().flatten();
+            if ver.as_deref() == Some(FOUNDRY_RECIPES_VER) {
+                if let Ok(Some(raw)) = db.get_setting("foundry_recipes") {
+                    if let Ok(cache) = serde_json::from_str::<FoundryRecipesCache>(&raw) {
+                        if !cache.by_result.is_empty() {
+                            return cache;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = self.refresh_foundry_recipes().await;
+        let db = self.db.lock().await;
+        db.get_setting("foundry_recipes")
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -1628,6 +1850,34 @@ pub fn resolve_lotus_label_indexed(
             return Some(n);
         }
     }
+    // Clan lab / foundry: ControlModuleResourceBlueprint → ControlModule (Модуль контроля)
+    if let Some(base_leaf) = leaf.strip_suffix("ResourceBlueprint") {
+        if let Some(n) = try_lotus_leaf(by_leaf, base_leaf) {
+            return Some(n);
+        }
+        // Morphics → Morphic, etc.
+        if let Some(singular) = base_leaf.strip_suffix('s') {
+            if !singular.is_empty() {
+                if let Some(n) = try_lotus_leaf(by_leaf, singular) {
+                    return Some(n);
+                }
+            }
+        }
+        if let Some(stripped) = key.strip_suffix("ResourceBlueprint") {
+            if let Some(n) = try_path(stripped) {
+                return Some(n);
+            }
+            if let Some(prod) = bp_product.get(stripped) {
+                if let Some(n) = try_path(prod) {
+                    return Some(n);
+                }
+                let prod_leaf = prod.rsplit('/').next().unwrap_or(prod.as_str());
+                if let Some(n) = try_lotus_leaf(by_leaf, prod_leaf) {
+                    return Some(n);
+                }
+            }
+        }
+    }
     if let Some(stripped) = key.strip_suffix("Blueprint") {
         if let Some(n) = try_path(stripped) {
             return Some(n);
@@ -1648,6 +1898,12 @@ pub fn resolve_lotus_label_indexed(
             }
         }
         let stripped_leaf = stripped.rsplit('/').next().unwrap_or(stripped);
+        // …/ControlModuleResource (after stripping Blueprint) → ControlModule
+        if let Some(base) = stripped_leaf.strip_suffix("Resource") {
+            if let Some(n) = try_lotus_leaf(by_leaf, base) {
+                return Some(n);
+            }
+        }
         if let Some(ru) = hardcoded_lotus_leaf_ru(stripped_leaf) {
             return Some(ru.to_string());
         }
@@ -1924,7 +2180,7 @@ pub fn resolve_lotus_reward_path<'a>(
     None
 }
 
-fn is_plausible_reward_path(path: &str) -> bool {
+pub fn is_plausible_reward_path(path: &str) -> bool {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if parts.len() < 4 {
         return false;
@@ -1932,7 +2188,15 @@ fn is_plausible_reward_path(path: &str) -> bool {
     let leaf = parts.last().copied().unwrap_or("");
     if matches!(
         leaf,
-        "StoreItems" | "Types" | "Recipes" | "Lotus" | "Components" | "Weapons" | "WarframeRecipes"
+        "StoreItems"
+            | "Types"
+            | "Recipes"
+            | "Lotus"
+            | "Components"
+            | "Weapons"
+            | "Weapon"
+            | "WarframeRecipes"
+            | "WeaponParts"
     ) {
         return false;
     }
@@ -2253,18 +2517,38 @@ fn set_key_from_blueprint_unique(unique: &str) -> Option<String> {
 }
 
 const CRAFT_GEAR_RECIPES_VER: &str = "3";
-const CRAFT_PART_QTY_VER: &str = "1";
+const CRAFT_PART_QTY_VER: &str = "2";
+const FOUNDRY_RECIPES_VER: &str = "2";
+
+fn recipe_specificity(ings: &[FoundryIngredient]) -> i64 {
+    ings.iter()
+        .map(|i| {
+            let u = i.unique_name.to_lowercase();
+            if u.contains("/miscitems/") || u.contains("/resources/") {
+                1
+            } else {
+                3
+            }
+        })
+        .sum()
+}
 
 fn craft_set_key_for_recipe(
     blueprint_unique: &str,
     result_unique: &str,
     weapons_en: &HashMap<String, String>,
+    frames_en: Option<&HashMap<String, String>>,
 ) -> Option<String> {
-    let from_en = weapons_en
+    // Prefer player-facing EN names over Lotus codenames (Brawler→atlas,
+    // TnoBladedPistols→akjagara). Blueprint leaf is last-resort only.
+    let from_weapon = weapons_en
         .get(result_unique)
         .and_then(|en| en_weapon_name_to_set_key(en));
+    let from_frame = frames_en
+        .and_then(|m| m.get(result_unique))
+        .and_then(|en| en_weapon_name_to_set_key(en));
     let from_bp = set_key_from_blueprint_unique(blueprint_unique);
-    let key = from_en.or(from_bp)?;
+    let key = from_weapon.or(from_frame).or(from_bp)?;
     Some(canonicalize_craft_set_key(&key))
 }
 
@@ -2279,6 +2563,15 @@ fn en_weapon_name_to_set_key(en: &str) -> Option<String> {
 
 fn is_component_blueprint_leaf(unique: &str) -> bool {
     let leaf = unique.rsplit('/').next().unwrap_or(unique);
+    let Some(base) = leaf
+        .strip_suffix("Blueprint")
+        .or_else(|| leaf.strip_suffix("blueprint"))
+    else {
+        return false;
+    };
+    // Match role as a PascalCase *suffix* only. Substring checks falsely
+    // flag finished gear like TnoBladedPistols (contains "Blade") or
+    // ChainLightningRifle / DoubleBarrelShotgun.
     [
         "Barrel",
         "Receiver",
@@ -2306,7 +2599,7 @@ fn is_component_blueprint_leaf(unique: &str) -> bool {
         "Head",
     ]
     .iter()
-    .any(|s| leaf.contains(s) && leaf.ends_with("Blueprint"))
+    .any(|s| base.ends_with(s))
 }
 
 fn craft_part_role_from_unique(unique: &str) -> Option<&'static str> {
@@ -2384,6 +2677,7 @@ fn canonicalize_craft_set_key(key: &str) -> String {
         "dual_corpus_minigun" => "dual_cestra".into(),
         "dual_grn_egypt_swd" => "twin_krohkur".into(),
         "brawler_knuckles" => "tekko".into(),
+        "cyte_09" => "cyte-09".into(),
         other => other.to_string(),
     }
 }
@@ -2451,6 +2745,28 @@ fn decompress_public_export_lzma(data: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod set_slug_tests {
     use super::*;
+
+    #[test]
+    fn component_bp_suffix_not_substring() {
+        assert!(is_component_blueprint_leaf(
+            "/Lotus/Types/Recipes/Weapons/AkjagaraPrimeBladeBlueprint"
+        ));
+        assert!(!is_component_blueprint_leaf(
+            "/Lotus/Types/Recipes/Weapons/TnoBladedPistolsBlueprint"
+        ));
+        assert!(!is_component_blueprint_leaf(
+            "/Lotus/Types/Recipes/Weapons/ChainLightningRifleBlueprint"
+        ));
+        assert!(!is_component_blueprint_leaf(
+            "/Lotus/Types/Recipes/Weapons/DoubleBarrelShotgunBlueprint"
+        ));
+        assert!(is_component_blueprint_leaf(
+            "/Lotus/Types/Recipes/WarframeRecipes/BrawlerHelmetBlueprint"
+        ));
+        assert!(!is_component_blueprint_leaf(
+            "/Lotus/Types/Recipes/WarframeRecipes/BrawlerBlueprint"
+        ));
+    }
 
     #[test]
     fn canonicalizes_part_pseudo_sets() {

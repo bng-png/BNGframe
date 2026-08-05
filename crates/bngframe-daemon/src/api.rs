@@ -52,6 +52,7 @@ pub fn router(services: Arc<Services>) -> Router {
         .route("/ws", get(ws_handler))
         .route("/rewards", get(list_rewards))
         .route("/rewards/trigger", post(trigger_reward))
+        .route("/rewards/memory-scan", post(reward_memory_scan))
         .route("/inventory", get(list_inventory))
         .route("/inventory/cache", get(inventory_cache))
         .route("/inventory/sync", post(sync_inventory))
@@ -82,6 +83,7 @@ pub fn router(services: Arc<Services>) -> Router {
         .route("/prices/item/{url_name}", get(price_item))
         .route("/worldstate", get(worldstate))
         .route("/mastery/sets", get(mastery_sets))
+        .route("/mastery/recipe/{set_key}", get(mastery_recipe))
         .with_state(services.clone());
 
     let pages = Router::new()
@@ -154,7 +156,7 @@ fn fallback_html(services: &Services) -> String {
   <div class="card">
     <h2>Статус</h2>
     <pre id="status">загрузка…</pre>
-    <button onclick="trigger()">OCR наград</button>
+    <button onclick="trigger()">Скан наград (память)</button>
     <button class="secondary" onclick="syncInv()">Синхр. инвентарь</button>
     <a class="btn secondary" href="/overlay" style="margin-left:8px">Оверлей</a>
   </div>
@@ -280,6 +282,7 @@ fn is_allowed_image_host(url: &str) -> bool {
             | "wiki.warframe.com"
             | "warframe.fandom.com"
             | "static.wikia.nocookie.net"
+            | "raw.githubusercontent.com"
             | "content.warframe.com"
             | "content-ps4.warframe.com"
             | "content-xb1.warframe.com"
@@ -302,6 +305,7 @@ async fn get_config(State(services): State<Arc<Services>>) -> impl IntoResponse 
 #[derive(Deserialize)]
 struct ConfigPatch {
     inventory_consent: Option<bool>,
+    reward_memory_consent: Option<bool>,
     overlay_enabled: Option<bool>,
     ocr_lang: Option<String>,
     eelog_path: Option<String>,
@@ -319,6 +323,9 @@ async fn update_config(
     let mut cfg = services.cfg.write().await;
     if let Some(v) = patch.inventory_consent {
         cfg.inventory_consent = v;
+    }
+    if let Some(v) = patch.reward_memory_consent {
+        cfg.reward_memory_consent = v;
     }
     if let Some(v) = patch.overlay_enabled {
         cfg.overlay_enabled = v;
@@ -379,6 +386,24 @@ async fn trigger_reward(State(services): State<Arc<Services>>) -> Result<impl In
         .await
         .map_err(ApiError::from)?;
     Ok(Json(reward))
+}
+
+async fn reward_memory_scan(
+    State(services): State<Arc<Services>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let consent = services.cfg.read().await.reward_memory_consent;
+    if !consent {
+        return Err(ApiError::msg(
+            "reward_memory_consent=false — enable in Settings / config.toml",
+        ));
+    }
+    let cache_dir = services.cfg.read().await.cache_dir.clone();
+    let mem = services.pipeline.mem.clone();
+    let scan = tokio::task::spawn_blocking(move || mem.debug_scan(&cache_dir))
+        .await
+        .map_err(|e| ApiError::msg(format!("join: {e}")))?
+        .map_err(ApiError::from)?;
+    Ok(Json(scan))
 }
 
 async fn list_inventory(State(services): State<Arc<Services>>) -> Result<impl IntoResponse, ApiError> {
@@ -837,6 +862,19 @@ async fn mastery_sets(State(services): State<Arc<Services>>) -> Result<impl Into
     ))
 }
 
+async fn mastery_recipe(
+    State(services): State<Arc<Services>>,
+    Path(set_key): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        services
+            .mastery
+            .recipe_for_set(&set_key)
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
 async fn price_item(
     State(services): State<Arc<Services>>,
     Path(url_name): Path<String>,
@@ -940,10 +978,16 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        warn!("api error: {e:#}");
+        let msg = format!("{e:#}");
+        // WikiImg cascades intentionally probe many candidate URLs; don't spam WARN.
+        if msg.contains("image fetch") || msg.contains("image previously failed") {
+            tracing::debug!("api image miss: {msg}");
+        } else {
+            warn!("api error: {msg}");
+        }
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("{e:#}"),
+            message: msg,
         }
     }
 }

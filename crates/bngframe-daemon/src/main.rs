@@ -13,6 +13,7 @@ use bngframe_core::inventory::InventoryService;
 use bngframe_core::market::MarketService;
 use bngframe_core::pricing::PricingService;
 use bngframe_core::relics::RelicService;
+use bngframe_core::reward_mem::RewardMemScanner;
 use bngframe_core::state::{AppState, DaemonStatus};
 use bngframe_core::stats::StatsService;
 use bngframe_core::analytics::AnalyticsService;
@@ -93,13 +94,23 @@ async fn main() -> Result<()> {
         db: db.clone(),
         pricing: pricing.clone(),
         overlay: overlay.clone(),
+        mem: Arc::new(RewardMemScanner::new()),
         capture_path: default_capture_path(&cfg.cache_dir),
-        prefetch: Arc::new(tokio::sync::Mutex::new(None)),
-        prefetch_ocr_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        visual_had_matches: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        mem_had_matches: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        prefetch_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cancel_prefetch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        reward_window: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        baseline_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         run_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
+
+    // Keep StoreItems baseline fresh while not on the reward screen.
+    {
+        let pipeline = pipeline.clone();
+        tokio::spawn(async move {
+            pipeline.baseline_refresher().await;
+        });
+    }
 
     // Warm item + image caches in background
     {
@@ -220,11 +231,17 @@ async fn main() -> Result<()> {
                     bngframe_core::eelog::EeEvent::RewardScreenOpening => {
                         let pipeline = pipeline.clone();
                         tokio::spawn(async move {
-                            pipeline.prefetch_capture().await;
+                            pipeline.prefetch_memory().await;
                         });
                     }
-                    bngframe_core::eelog::EeEvent::RewardScreen { reward_paths } => {
-                        if let Err(e) = pipeline.run_with_paths("eelog", &reward_paths).await {
+                    bngframe_core::eelog::EeEvent::RewardScreen {
+                        reward_paths,
+                        party_size,
+                    } => {
+                        if let Err(e) = pipeline
+                            .run_with_paths_party("eelog", &reward_paths, party_size)
+                            .await
+                        {
                             warn!("reward pipeline: {e}");
                             state.set_error(format!("reward pipeline: {e}")).await;
                         }

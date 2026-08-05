@@ -22,6 +22,8 @@ pub struct Config {
     /// "rapidocr", or "tesseract".
     pub ocr_engine: String,
     pub inventory_consent: bool,
+    /// Read squad reward Lotus paths from Warframe process memory (ptrace).
+    pub reward_memory_consent: bool,
     pub wfmarket_jwt: Option<String>,
     pub monitor: Option<String>,
     pub overlay_enabled: bool,
@@ -51,6 +53,7 @@ impl Default for Config {
             ocr_lang: "rus+eng".into(),
             ocr_engine: "auto".into(),
             inventory_consent: false,
+            reward_memory_consent: false,
             wfmarket_jwt: None,
             monitor: None,
             overlay_enabled: true,

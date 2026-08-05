@@ -21,6 +21,9 @@ const REWARD_OPEN_TRIGGERS: &[&str] = &[
 /// Local (and rarely others') reward paths appear just before Got rewards.
 const REWARD_PATH_RE: &str =
     r"VoidProjections:\s+([0-9a-fA-F]+)\s+gets reward\s+(/\S+)";
+/// Squad size: "Host/Client got reward info from <accountId>"
+const REWARD_INFO_RE: &str =
+    r"(?i)VoidProjections:.*got reward info from\s+([0-9a-fA-F]{16,})";
 
 const RELIC_SELECT_PATTERNS: &[&str] = &[
     "ProjectionSelection.lua",
@@ -35,7 +38,11 @@ const REWARD_DEBOUNCE: Duration = Duration::from_secs(8);
 pub enum EeEvent {
     /// Fissure reward choice UI is up. `reward_paths` are Lotus StoreItems paths
     /// parsed from recent `VoidProjections: … gets reward …` lines (often only local).
-    RewardScreen { reward_paths: Vec<String> },
+    /// `party_size` is how many players the client has reward info for (2–4).
+    RewardScreen {
+        reward_paths: Vec<String>,
+        party_size: usize,
+    },
     /// Screen is opening — start capture burst before Got rewards (paths may be empty).
     RewardScreenOpening,
     RelicSelectScreen,
@@ -70,7 +77,12 @@ impl EeLogWatcher {
         Ok(())
     }
 
-    pub fn read_new(&mut self, pending_paths: &mut Vec<String>, recent_paths: &mut Vec<String>) -> Result<Vec<EeEvent>> {
+    pub fn read_new(
+        &mut self,
+        pending_paths: &mut Vec<String>,
+        recent_paths: &mut Vec<String>,
+        pending_accounts: &mut Vec<String>,
+    ) -> Result<Vec<EeEvent>> {
         if !self.path.exists() {
             return Ok(vec![]);
         }
@@ -80,6 +92,7 @@ impl EeLogWatcher {
             self.offset = 0;
             pending_paths.clear();
             recent_paths.clear();
+            pending_accounts.clear();
         }
         if len == self.offset {
             return Ok(vec![]);
@@ -96,9 +109,11 @@ impl EeLogWatcher {
         let buf = String::from_utf8_lossy(&raw);
 
         let path_re = Regex::new(REWARD_PATH_RE).expect("reward path regex");
+        let info_re = Regex::new(REWARD_INFO_RE).expect("reward info regex");
         let mut events = Vec::new();
         for line in buf.lines() {
             if let Some(c) = path_re.captures(line) {
+                let account = c[1].to_string();
                 let path = c[2].to_string();
                 if path.eq_ignore_ascii_case("/null") {
                     debug!("EE.log void reward path ignored: {path}");
@@ -107,6 +122,9 @@ impl EeLogWatcher {
                 info!("EE.log void reward path: {path}");
                 pending_paths.push(path.clone());
                 recent_paths.push(path);
+                if !pending_accounts.iter().any(|a| a == &account) {
+                    pending_accounts.push(account);
+                }
                 // Keep a short window only
                 if pending_paths.len() > 8 {
                     let drain = pending_paths.len() - 8;
@@ -117,21 +135,37 @@ impl EeLogWatcher {
                     recent_paths.drain(0..drain);
                 }
             }
+            if let Some(c) = info_re.captures(line) {
+                let account = c[1].to_string();
+                if !pending_accounts.iter().any(|a| a == &account) {
+                    pending_accounts.push(account);
+                }
+            }
             if line.contains(REWARD_TRIGGER) {
                 info!("EE.log reward screen: {}", line.trim());
-                let mut paths = std::mem::take(pending_paths);
-                if paths.is_empty() && !recent_paths.is_empty() {
-                    debug!("reward trigger without fresh paths; reusing recent reward paths");
-                    paths = recent_paths.clone();
-                } else if !paths.is_empty() {
-                    *recent_paths = paths.clone();
-                }
-                // Consume recent paths after firing so a later empty trigger
-                // does not replay stale rewards from a previous fissure.
+                // Only paths collected since Opening for *this* fissure.
+                // Never replay recent_paths from a previous relic (showed stale Xaku).
+                let paths = std::mem::take(pending_paths);
                 recent_paths.clear();
-                events.push(EeEvent::RewardScreen { reward_paths: paths });
+                let mut party_size = pending_accounts.len();
+                pending_accounts.clear();
+                if party_size == 0 {
+                    party_size = paths.len().max(1);
+                }
+                party_size = party_size.clamp(1, 4);
+                info!(
+                    "EE.log party_size={party_size} local_paths={}",
+                    paths.len()
+                );
+                events.push(EeEvent::RewardScreen {
+                    reward_paths: paths,
+                    party_size,
+                });
             } else if REWARD_OPEN_TRIGGERS.iter().any(|p| line.contains(p)) {
                 info!("EE.log reward opening: {}", line.trim());
+                pending_accounts.clear();
+                pending_paths.clear();
+                recent_paths.clear();
                 events.push(EeEvent::RewardScreenOpening);
             } else if RELIC_SELECT_PATTERNS.iter().any(|p| line.contains(p)) {
                 info!("EE.log relic select: {}", line.trim());
@@ -183,18 +217,16 @@ impl EeLogWatcher {
             let mut last_opening: Option<Instant> = None;
             let mut pending_paths: Vec<String> = Vec::new();
             let mut recent_paths: Vec<String> = Vec::new();
+            let mut pending_accounts: Vec<String> = Vec::new();
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
                     Some(()) = n_rx.recv() => {}
                 }
-                match self.read_new(&mut pending_paths, &mut recent_paths) {
+                match self.read_new(&mut pending_paths, &mut recent_paths, &mut pending_accounts) {
                     Ok(events) => {
-                        // Wine often flushes Opening + Got rewards in one chunk.
-                        // Prefetch then is useless (Got consumes an empty slot) —
-                        // skip Opening when RewardScreen is in the same batch.
-                        let got_in_batch =
-                            events.iter().any(|e| matches!(e, EeEvent::RewardScreen { .. }));
+                        // Wine often flushes Opening + Got in one chunk. Still emit
+                        // Opening first so baseline can start before Got runs.
                         for ev in events {
                             let ev = match &ev {
                                 EeEvent::RewardScreen { .. } => {
@@ -209,10 +241,6 @@ impl EeLogWatcher {
                                     ev
                                 }
                                 EeEvent::RewardScreenOpening => {
-                                    if got_in_batch {
-                                        debug!("skip Opening — Got rewards in same EE flush");
-                                        continue;
-                                    }
                                     if last_opening
                                         .map(|t| t.elapsed() < Duration::from_secs(3))
                                         .unwrap_or(false)

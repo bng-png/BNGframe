@@ -1,11 +1,11 @@
 # BNGframe
 
-AlecaFrame-style Warframe companion for **Linux Wayland**: relic reward overlay (EE.log → capture → OCR → prices), inventory sync via read-only Proton memory → DE mobile API, relic planner, warframe.market, rivens, stats & analytics.
+AlecaFrame-style Warframe companion for **Linux Wayland**: relic reward overlay (EE.log → process memory Lotus paths → prices), inventory sync via read-only Proton memory → DE mobile API, relic planner, warframe.market, rivens, stats & analytics.
 
 ```
 Browser SPA (web/)  <── HTTP/WS 127.0.0.1:17832 ──>  bngframe daemon (Rust)
-                                                         ├─ EE.log watcher
-                                                         ├─ grim + tesseract
+                                                         ├─ EE.log watcher (timing)
+                                                         ├─ reward memory scrape (squad slots)
                                                          ├─ inventory memory scrape
                                                          └─ overlay HTML + notify-send
 ```
@@ -14,11 +14,11 @@ Browser SPA (web/)  <── HTTP/WS 127.0.0.1:17832 ──>  bngframe daemon (Ru
 
 - Rust toolchain, Node 20+
 - Wayland compositor (tested target: **Hyprland** / wlroots)
-- `grim`, `tesseract` (+ `tesseract-data-eng`; for Russian game UI also `tesseract-data-rus`)
 - Warframe via Steam/Proton
 - Optional: `notify-send`, `hyprctl`
+- ptrace for inventory **and** reward memory (`ptrace_scope=0` or `cap_sys_ptrace`)
 
-OCR for relic rewards defaults to `rus+eng` (Russian client + English fallback). The catalog stores WFM `i18n.ru` names so Cyrillic OCR can match market items. In Settings set OCR lang to `rus`, `eng`, or `rus+eng`, then refresh the market catalog once so `name_ru` is cached.
+Relic rewards: EE.log gives the local Lotus path + party size; memory may add co-located StoreItems when a tight EE neighborhood exists; **OCR fills remaining squad slots** (other players' paths are rarely present as StoreItems in Proton heaps — catalog floods are ignored).
 
 ## Quick start
 
@@ -59,12 +59,14 @@ This reads a short-lived session token from the Proton process and calls DE’s 
 
 Fallback: place an inventory JSON dump and use **Import dump** / `POST /api/inventory/import`.
 
-## Relic overlay
+## Relic overlay (memory)
 
-1. Keep the daemon running while playing.
-2. When the reward screen appears, EE.log triggers capture + OCR.
-3. Manual fallback: Overview → **Trigger reward OCR**, or `POST /api/rewards/trigger`.
-4. Open `/overlay` in a pinned browser window (see `~/.local/share/bngframe/hyprland-overlay.md`).
+1. Set `reward_memory_consent = true` in config (or Settings).
+2. Keep the daemon running while playing (same ptrace requirements as inventory).
+3. When the reward screen opens, EE.log triggers a full-region memory poll; Lotus paths are resolved to market items.
+4. Manual: Overview → **Scan rewards from memory**, or `POST /api/rewards/trigger`.
+5. Debug dump: `POST /api/rewards/memory-scan` → JSON + `~/.cache/bngframe/reward_mem_*.txt`.
+6. Open `/overlay` in a pinned browser window (see `~/.local/share/bngframe/hyprland-overlay.md`).
 
 Hyprland example rules:
 
@@ -82,7 +84,8 @@ windowrulev2 = nofocus, title:^(BNGframe Overlay)$
 | GET | `/api/status` | Daemon status |
 | GET/POST | `/api/config` | Settings |
 | GET | `/api/ws` | Events |
-| POST | `/api/rewards/trigger` | Manual OCR |
+| POST | `/api/rewards/trigger` | Manual memory reward scan |
+| POST | `/api/rewards/memory-scan` | Debug memory harvest dump |
 | POST | `/api/inventory/sync` | Memory inventory |
 | GET | `/api/relics` | Relic planner |
 | POST | `/api/market/signin` | WFM auth |
@@ -100,8 +103,8 @@ Bound to `127.0.0.1` by default. CORS allows only localhost origins.
 ## Project layout
 
 ```
-crates/bngframe-core/      # EE.log, DB, pricing, inventory, relics, rivens, …
-crates/bngframe-capture/  # grim capture
+crates/bngframe-core/      # EE.log, DB, pricing, inventory, reward_mem, …
+crates/bngframe-capture/  # grim capture (legacy / unused by reward path)
 crates/bngframe-overlay/  # overlay HTML + notifications
 crates/bngframe-daemon/   # axum API + orchestration
 web/                      # React companion SPA
